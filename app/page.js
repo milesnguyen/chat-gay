@@ -149,9 +149,14 @@ export default function Home() {
         image_url = supabase.storage.from('images').getPublicUrl(path).data.publicUrl
       }
       const { error } = await supabase.from('messages').insert({ name: name.trim(), message: text.trim() || null, image_url, channel_id: channelId, reply_to: replyTo?.id || null })
-      if (error) throw error
+      if (error) {
+        if (String(error.message || '').includes('USER_BLOCKED')) {
+          throw new Error('Bạn đã bị block và không thể gửi tin nhắn.')
+        }
+        throw error
+      }
       setText(''); setFile(null); setReplyTo(null); setShowEmoji(false); if (input.current) input.current.value = ''
-    } catch (err) { alert('Gửi tin nhắn thất bại: ' + err.message) }
+    } catch (err) { alert(err.message || 'Gửi tin nhắn thất bại.') }
     finally { setSending(false) }
   }
 

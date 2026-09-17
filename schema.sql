@@ -49,6 +49,30 @@ for insert with check (
   and not exists (select 1 from public.blocked_users b where lower(b.name) = lower(messages.name))
 );
 
+-- Database-level protection: a blocked user cannot insert new messages.
+create or replace function public.reject_blocked_message()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if exists (
+    select 1 from public.blocked_users b
+    where lower(trim(b.name)) = lower(trim(new.name))
+  ) then
+    raise exception 'USER_BLOCKED';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists messages_reject_blocked_user on public.messages;
+create trigger messages_reject_blocked_user
+before insert on public.messages
+for each row
+execute function public.reject_blocked_message();
+
 drop policy if exists "Anyone can read channels" on public.chat_channels;
 create policy "Anyone can read channels" on public.chat_channels for select using (true);
 
