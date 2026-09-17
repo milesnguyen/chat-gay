@@ -18,6 +18,10 @@ export default function Home() {
   const [channelId, setChannelId] = useState('')
   const [file, setFile] = useState(null)
   const [sending, setSending] = useState(false)
+  const [typingUsers, setTypingUsers] = useState([])
+  const [replyTo, setReplyTo] = useState(null)
+  const [showEmoji, setShowEmoji] = useState(false)
+  const [reactions, setReactions] = useState({})
   const [notificationPermission, setNotificationPermission] = useState('default')
   const [adminOpen, setAdminOpen] = useState(false)
   const [adminLogged, setAdminLogged] = useState(false)
@@ -30,6 +34,7 @@ export default function Home() {
   const channelRef = useRef(null)
   const bottomRef = useRef(null)
   const input = useRef(null)
+  const typingTimer = useRef(null)
 
   useEffect(() => {
     const saved = localStorage.getItem(USER_KEY)
@@ -84,22 +89,41 @@ export default function Home() {
     async function loadMessages() {
       const { data, error } = await supabase.from('messages').select('*').eq('channel_id', channelId).order('created_at', { ascending: true }).limit(200)
       if (!error && active) setMessages(data || [])
+      const ids = (data || []).map(m => m.id)
+      if (ids.length) {
+        const { data: rx } = await supabase.from('message_reactions').select('*').in('message_id', ids)
+        const grouped = {}
+        ;(rx || []).forEach(r => { grouped[r.message_id] = [...(grouped[r.message_id] || []), r] })
+        if (active) setReactions(grouped)
+      } else if (active) setReactions({})
     }
     loadMessages()
 
-    const realtime = supabase.channel(`pink-chat-${channelId}`, { config: { presence: { key: crypto.randomUUID() } } })
+    const realtime = supabase.channel(`pink-chat-${channelId}`, { config: { presence: { key: crypto.randomUUID() }, broadcast: { self: false } } })
     channelRef.current = realtime
     realtime
       .on('presence', { event: 'sync' }, () => {
         const state = realtime.presenceState()
-        const people = Object.values(state).flat().map(x => x.name).filter(Boolean)
-        setOnline([...new Set(people)])
+        const all = Object.values(state).flat()
+        setOnline([...new Set(all.map(x => x.name).filter(Boolean))])
+        setTypingUsers([...new Set(all.filter(x => x.typing && x.name !== name).map(x => x.name))])
+      })
+      .on('presence', { event: 'join' }, () => {})
+      .on('broadcast', { event: 'typing' }, ({ payload }) => {
+        if (payload?.name === name) return
+        setTypingUsers(prev => payload?.typing ? [...new Set([...prev, payload.name])] : prev.filter(x => x !== payload.name))
       })
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `channel_id=eq.${channelId}` }, payload => {
         setMessages(prev => prev.some(m => m.id === payload.new.id) ? prev : [...prev, payload.new])
         notifyNewMessage(payload.new)
       })
-      .subscribe(async status => { if (status === 'SUBSCRIBED') await realtime.track({ name: name.trim(), online_at: new Date().toISOString() }) })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'message_reactions' }, payload => {
+        setReactions(prev => ({ ...prev, [payload.new.message_id]: [...(prev[payload.new.message_id] || []).filter(r => !(r.name === payload.new.name && r.emoji === payload.new.emoji)), payload.new] }))
+      })
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'message_reactions' }, payload => {
+        setReactions(prev => ({ ...prev, [payload.old.message_id]: (prev[payload.old.message_id] || []).filter(r => r.id !== payload.old.id) }))
+      })
+      .subscribe(async status => { if (status === 'SUBSCRIBED') await realtime.track({ name: name.trim(), online_at: new Date().toISOString(), typing: false }) })
 
     return () => { active = false; supabase.removeChannel(realtime); if (channelRef.current === realtime) channelRef.current = null }
   }, [joined, name, channelId])
@@ -124,12 +148,37 @@ export default function Home() {
         if (uploadError) throw uploadError
         image_url = supabase.storage.from('images').getPublicUrl(path).data.publicUrl
       }
-      const { error } = await supabase.from('messages').insert({ name: name.trim(), message: text.trim() || null, image_url, channel_id: channelId })
+      const { error } = await supabase.from('messages').insert({ name: name.trim(), message: text.trim() || null, image_url, channel_id: channelId, reply_to: replyTo?.id || null })
       if (error) throw error
-      setText(''); setFile(null); if (input.current) input.current.value = ''
+      setText(''); setFile(null); setReplyTo(null); setShowEmoji(false); if (input.current) input.current.value = ''
     } catch (err) { alert('Gửi tin nhắn thất bại: ' + err.message) }
     finally { setSending(false) }
   }
+
+  async function updateTyping(value) {
+    setText(value)
+    if (!channelRef.current) return
+    clearTimeout(typingTimer.current)
+    try { await channelRef.current.track({ name: name.trim(), online_at: new Date().toISOString(), typing: true }) } catch {}
+    typingTimer.current = setTimeout(async () => {
+      try { await channelRef.current.track({ name: name.trim(), online_at: new Date().toISOString(), typing: false }) } catch {}
+    }, 1200)
+  }
+
+  function addEmoji(emoji) { setText(v => v + emoji); setShowEmoji(false); input.current?.focus() }
+
+  async function toggleReaction(messageId, emoji) {
+    const existing = (reactions[messageId] || []).find(r => r.name === name && r.emoji === emoji)
+    if (existing) {
+      await supabase.from('message_reactions').delete().eq('id', existing.id)
+      setReactions(prev => ({ ...prev, [messageId]: (prev[messageId] || []).filter(r => r.id !== existing.id) }))
+    } else {
+      const { data, error } = await supabase.from('message_reactions').insert({ message_id: messageId, name: name.trim(), emoji }).select().single()
+      if (!error && data) setReactions(prev => ({ ...prev, [messageId]: [...(prev[messageId] || []), data] }))
+    }
+  }
+
+  function startReply(message) { setReplyTo(message); input.current?.focus() }
 
   function chooseImage(e) {
     const f = e.target.files?.[0]; if (!f) return

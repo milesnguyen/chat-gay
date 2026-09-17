@@ -138,3 +138,33 @@ grant execute on function public.admin_verify(text,text) to anon, authenticated;
 grant execute on function public.admin_create_channel(text,text,text) to anon, authenticated;
 grant execute on function public.admin_block_user(text,text,text) to anon, authenticated;
 grant execute on function public.admin_unblock_user(text,text,text) to anon, authenticated;
+
+-- Tính năng reply + reaction
+alter table public.messages add column if not exists reply_to uuid references public.messages(id) on delete set null;
+
+create table if not exists public.message_reactions (
+  id uuid primary key default gen_random_uuid(),
+  message_id uuid not null references public.messages(id) on delete cascade,
+  name text not null check (char_length(name) between 1 and 30),
+  emoji text not null check (char_length(emoji) between 1 and 8),
+  created_at timestamptz not null default now(),
+  unique(message_id, name, emoji)
+);
+
+alter table public.message_reactions enable row level security;
+drop policy if exists "Anyone can read reactions" on public.message_reactions;
+drop policy if exists "Anyone can add reactions" on public.message_reactions;
+drop policy if exists "Anyone can remove reactions" on public.message_reactions;
+create policy "Anyone can read reactions" on public.message_reactions for select using (true);
+create policy "Anyone can add reactions" on public.message_reactions for insert with check (char_length(name) between 1 and 30);
+create policy "Anyone can remove reactions" on public.message_reactions for delete using (true);
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'message_reactions'
+  ) then
+    alter publication supabase_realtime add table public.message_reactions;
+  end if;
+end $$;
