@@ -1,23 +1,63 @@
 -- Pink Chat: chạy toàn bộ đoạn này trong Supabase SQL Editor
 
-create table if not exists public.messages (
+create extension if not exists pgcrypto;
+
+create table if not exists public.chat_channels (
   id uuid primary key default gen_random_uuid(),
-  name text not null check (char_length(name) between 1 and 30),
-  text text,
-  image_url text,
+  name text not null unique check (char_length(trim(name)) between 1 and 40),
   created_at timestamptz not null default now()
 );
 
+insert into public.chat_channels (name)
+values ('Chung')
+on conflict (name) do nothing;
+
+create table if not exists public.blocked_users (
+  name text primary key,
+  blocked_at timestamptz not null default now()
+);
+
+create table if not exists public.messages (
+  id uuid primary key default gen_random_uuid(),
+  name text not null check (char_length(name) between 1 and 30),
+  message text,
+  image_url text,
+  channel_id uuid references public.chat_channels(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+
+-- Tương thích database cũ nếu bảng messages đã tồn tại.
+alter table public.messages add column if not exists message text;
+alter table public.messages add column if not exists image_url text;
+alter table public.messages add column if not exists channel_id uuid references public.chat_channels(id) on delete cascade;
+
+update public.messages
+set channel_id = (select id from public.chat_channels where name = 'Chung' limit 1)
+where channel_id is null;
+
+
 alter table public.messages enable row level security;
+alter table public.chat_channels enable row level security;
+alter table public.blocked_users enable row level security;
 
 drop policy if exists "Anyone can read messages" on public.messages;
 drop policy if exists "Anyone can send messages" on public.messages;
 create policy "Anyone can read messages" on public.messages for select using (true);
-create policy "Anyone can send messages" on public.messages for insert with check (char_length(name) between 1 and 30);
+create policy "Anyone can send messages" on public.messages
+for insert with check (
+  char_length(name) between 1 and 30
+  and not exists (select 1 from public.blocked_users b where lower(b.name) = lower(messages.name))
+);
 
--- Cho Realtime theo dõi INSERT của bảng messages
-alter table public.messages replica identity full;
+drop policy if exists "Anyone can read channels" on public.chat_channels;
+create policy "Anyone can read channels" on public.chat_channels for select using (true);
 
+drop policy if exists "No direct channel creation" on public.chat_channels;
+-- Kênh chỉ nên được tạo qua RPC admin bên dưới.
+
+drop policy if exists "No direct blocked user access" on public.blocked_users;
+
+-- Realtime
 do $$
 begin
   if not exists (
@@ -28,12 +68,73 @@ begin
   end if;
 end $$;
 
--- Bucket ảnh công khai
-insert into storage.buckets (id, name, public)
-values ('chat-images', 'chat-images', true)
-on conflict (id) do update set public = true;
+-- Admin đơn giản cho bản demo. Không đưa mật khẩu vào frontend.
+create or replace function public.admin_create_channel(admin_name text, admin_password text, channel_name text)
+returns public.chat_channels
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare result public.chat_channels;
+begin
+  if admin_name <> 'Miles' or admin_password <> 'thinh2505' then
+    raise exception 'Sai tài khoản hoặc mật khẩu admin';
+  end if;
+  insert into public.chat_channels(name)
+  values (trim(channel_name))
+  on conflict (name) do update set name = excluded.name
+  returning * into result;
+  return result;
+end;
+$$;
 
-drop policy if exists "Anyone can upload chat images" on storage.objects;
-drop policy if exists "Anyone can view chat images" on storage.objects;
-create policy "Anyone can upload chat images" on storage.objects for insert with check (bucket_id = 'chat-images');
-create policy "Anyone can view chat images" on storage.objects for select using (bucket_id = 'chat-images');
+create or replace function public.admin_block_user(admin_name text, admin_password text, user_name text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if admin_name <> 'Miles' or admin_password <> 'thinh2505' then
+    raise exception 'Sai tài khoản hoặc mật khẩu admin';
+  end if;
+  if lower(trim(user_name)) = 'miles' then
+    raise exception 'Không thể block admin';
+  end if;
+  insert into public.blocked_users(name) values (trim(user_name)) on conflict (name) do nothing;
+  return true;
+end;
+$$;
+
+create or replace function public.admin_unblock_user(admin_name text, admin_password text, user_name text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if admin_name <> 'Miles' or admin_password <> 'thinh2505' then
+    raise exception 'Sai tài khoản hoặc mật khẩu admin';
+  end if;
+  delete from public.blocked_users where lower(name) = lower(trim(user_name));
+  return true;
+end;
+$$;
+
+
+create or replace function public.admin_verify(admin_name text, admin_password text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  return admin_name = 'Miles' and admin_password = 'thinh2505';
+end;
+$$;
+
+grant execute on function public.admin_verify(text,text) to anon, authenticated;
+
+grant execute on function public.admin_create_channel(text,text,text) to anon, authenticated;
+grant execute on function public.admin_block_user(text,text,text) to anon, authenticated;
+grant execute on function public.admin_unblock_user(text,text,text) to anon, authenticated;
