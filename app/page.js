@@ -443,6 +443,101 @@ export default function Home() {
     }
   }, [joined, name, channelId])
 
+  async function sendSticker(sticker) {
+    if (sending || !channelId || !sticker) return
+    setSending(true); setSendError('')
+    try {
+      const { error } = await supabase.from('messages').insert({
+        name: name.trim(), message: null, image_url: null,
+        sticker_url: sticker.url, message_type: 'sticker',
+        channel_id: channelId, reply_to: replyTo?.id || null
+      })
+      if (error) throw error
+      setReplyTo(null); setShowStickers(false); setShowEmoji(false)
+    } catch (err) {
+      setSendError(err.message || 'Gửi sticker thất bại.')
+    } finally { setSending(false) }
+  }
+
+  async function send() {
+    if (sending || (!text.trim() && !file) || !channelId) return
+    setSending(true); setSendError('')
+    try {
+      let image_url = null
+      if (file) {
+        const ext = file.name.split('.').pop()?.toLowerCase() || 'jpg'
+        const path = `${crypto.randomUUID()}.${ext}`
+        const { error: uploadError } = await supabase.storage.from('images').upload(path, file, { contentType: file.type, upsert: false })
+        if (uploadError) throw uploadError
+        image_url = supabase.storage.from('images').getPublicUrl(path).data.publicUrl
+      }
+      const { error } = await supabase.from('messages').insert({
+        name: name.trim(), message: text.trim() || null, image_url,
+        channel_id: channelId, reply_to: replyTo?.id || null
+      })
+      if (error) {
+        if (String(error.message || '').includes('USER_BLOCKED')) throw new Error('Bạn đã bị block và không thể gửi tin nhắn.')
+        throw error
+      }
+      setText(''); setFile(null); setReplyTo(null); setShowEmoji(false)
+      if (fileInput.current) fileInput.current.value = ''
+    } catch (err) {
+      setSendError(err.message || 'Gửi tin nhắn thất bại.')
+    } finally { setSending(false) }
+  }
+
+  async function retrySend() {
+    if (!text.trim() && !file) return
+    setSendError('')
+    await send()
+  }
+
+  async function updateTyping(value) {
+    setText(value)
+    if (!channelRef.current) return
+    clearTimeout(typingTimer.current)
+    try { await channelRef.current.send({ type: 'broadcast', event: 'typing', payload: { name: name.trim(), typing: true } }) } catch {}
+    typingTimer.current = setTimeout(async () => {
+      try { await channelRef.current?.send({ type: 'broadcast', event: 'typing', payload: { name: name.trim(), typing: false } }) } catch {}
+    }, 1200)
+  }
+
+  function addEmoji(emoji) { setText(v => v + emoji); setShowEmoji(false); input.current?.focus() }
+
+  async function toggleReaction(messageId, emoji) {
+    const existing = (reactions[messageId] || []).find(r => r.name === name && r.emoji === emoji)
+    if (existing) {
+      const { error } = await supabase.from('message_reactions').delete().eq('id', existing.id)
+      if (!error) setReactions(prev => ({ ...prev, [messageId]: (prev[messageId] || []).filter(r => r.id !== existing.id) }))
+    } else {
+      const { data, error } = await supabase.from('message_reactions').insert({ message_id: messageId, name: name.trim(), emoji }).select().single()
+      if (!error && data) setReactions(prev => ({ ...prev, [messageId]: [...(prev[messageId] || []), data] }))
+    }
+  }
+
+  function startReply(message) { setReplyTo(message); input.current?.focus() }
+
+  function handlePaste(e) {
+    const items = Array.from(e.clipboardData?.items || [])
+    const imageItem = items.find(item => item.type.startsWith('image/'))
+    if (!imageItem) return
+    const pastedFile = imageItem.getAsFile()
+    if (!pastedFile) return
+    e.preventDefault()
+    if (pastedFile.size > 5 * 1024 * 1024) return alert('Ảnh tối đa 5MB.')
+    const ext = pastedFile.type.split('/')[1] || 'png'
+    const imageFile = new File([pastedFile], `pasted-${Date.now()}.${ext}`, { type: pastedFile.type })
+    setFile(imageFile)
+  }
+
+  function chooseImage(e) {
+    const f = e.target.files?.[0]
+    if (!f) return
+    if (!f.type.startsWith('image/')) return alert('Chỉ chọn file ảnh.')
+    if (f.size > 5 * 1024 * 1024) return alert('Ảnh tối đa 5MB.')
+    setFile(f)
+  }
+
   function handleMessagesScroll(e) {
     const el = e.currentTarget
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100
