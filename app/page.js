@@ -310,9 +310,10 @@ export default function Home() {
   useEffect(() => {
     if (!joined || !name.trim() || !channelId) return
     const clientId = getLiveClientId()
-    const signal = supabase.channel(`pink-chat-live-${channelId}`, { config: { broadcast: { self: false } } })
+    const signal = supabase.channel(`pink-chat-live-${channelId}`, { config: { broadcast: { self: false }, presence: { key: clientId } } })
     liveSignalRef.current = signal
     let alive = true
+    const pendingIceRef = new Map()
 
     const sendSignal = payload => signal.send({ type: 'broadcast', event: 'live-signal', payload }).catch(() => {})
 
@@ -335,6 +336,38 @@ export default function Home() {
       setLiveViewers(livePeersRef.current.size)
     }
 
+    const announceLiveToViewer = async (viewerId) => {
+      if (!isHostingLiveRef.current || !liveStreamRef.current) return
+      await sendSignal({
+        type: 'live-start',
+        from: clientId,
+        hostName: name.trim(),
+        startedAt: liveRef.current?.startedAt || new Date().toISOString(),
+        to: viewerId || null
+      })
+      if (viewerId) await makeHostPeer(viewerId)
+    }
+
+    const syncLivePresence = () => {
+      const state = signal.presenceState()
+      const entries = Object.values(state).flat()
+      const host = entries.find(x => x?.role === 'host' && x.clientId !== clientId && x.channelId === String(channelId))
+      if (host && !isHostingLiveRef.current) {
+        setLive(prev => prev?.hostId === host.clientId ? prev : { hostId: host.clientId, hostName: host.hostName, startedAt: host.startedAt })
+        setLiveError('')
+        sendSignal({ type: 'viewer-join', from: clientId, to: host.clientId })
+      } else if (!host && !isHostingLiveRef.current) {
+        setLive(null)
+        setRemoteStream(null)
+        liveViewerPeerRef.current?.close()
+        liveViewerPeerRef.current = null
+      }
+      if (isHostingLiveRef.current) {
+        const viewers = entries.filter(x => x?.role === 'viewer' && x.clientId !== clientId && x.channelId === String(channelId))
+        setLiveViewers(new Set(viewers.map(x => x.clientId)).size)
+      }
+    }
+
     const handleSignal = async ({ payload }) => {
       if (!alive || !payload || (payload.to && payload.to !== clientId)) return
       try {
@@ -350,7 +383,7 @@ export default function Home() {
         if (payload.type === 'live-request') {
           // Viewer vào phòng sau khi host đã bắt đầu live sẽ yêu cầu host gửi lại trạng thái.
           if (isHostingLiveRef.current && payload.from !== clientId) {
-            await sendSignal({ type:'live-start', from:clientId, hostName:name.trim(), startedAt:liveRef.current?.startedAt || new Date().toISOString(), to:payload.from })
+            await announceLiveToViewer(payload.from)
           }
           return
         }
@@ -359,7 +392,7 @@ export default function Home() {
           return
         }
         if (payload.type === 'viewer-join' && isHostingLiveRef.current && payload.to === clientId) {
-          await makeHostPeer(payload.from); return
+          await announceLiveToViewer(payload.from); return
         }
         if (payload.type === 'offer' && payload.to === clientId && !isHostingLiveRef.current) {
           liveHostRef.current = payload.from
@@ -370,6 +403,11 @@ export default function Home() {
           pc.ontrack = e => { const stream = e.streams?.[0] || new MediaStream([e.track]); setRemoteStream(stream) }
           pc.onconnectionstatechange = () => { if (['failed','closed','disconnected'].includes(pc.connectionState)) { setRemoteStream(null); setLiveError('Kết nối livestream bị gián đoạn.') } }
           await pc.setRemoteDescription(payload.offer)
+          const queued = pendingIceRef.get(payload.from) || []
+          for (const candidate of queued) {
+            try { await pc.addIceCandidate(candidate) } catch {}
+          }
+          pendingIceRef.delete(payload.from)
           const answer = await pc.createAnswer()
           await pc.setLocalDescription(answer)
           await sendSignal({ type:'answer', from:clientId, to:payload.from, answer:pc.localDescription })
@@ -382,28 +420,47 @@ export default function Home() {
         }
         if (payload.type === 'ice' && payload.to === clientId && payload.candidate) {
           const pc = isHostingLiveRef.current ? livePeersRef.current.get(payload.from) : liveViewerPeerRef.current
-          if (pc && pc.remoteDescription) await pc.addIceCandidate(payload.candidate)
+          if (!pc) return
+          if (pc.remoteDescription) {
+            try { await pc.addIceCandidate(payload.candidate) } catch {}
+          } else {
+            const list = pendingIceRef.get(payload.from) || []
+            list.push(payload.candidate)
+            pendingIceRef.set(payload.from, list)
+          }
           return
         }
       } catch (err) { console.error('WebRTC signaling error', err); setLiveError(err.message || 'Không thể kết nối livestream.') }
     }
 
-    signal.on('broadcast', { event: 'live-signal' }, handleSignal).subscribe(async status => {
-      if (status === 'SUBSCRIBED') {
-        // Host thông báo live ngay khi kết nối signaling; viewer mới vào phòng sẽ
-        // gửi live-request để nhận lại thông báo và sau đó tạo WebRTC peer.
-        if (isHostingLiveRef.current && liveStreamRef.current) {
-          await sendSignal({ type:'live-start', from:clientId, hostName:name.trim(), startedAt:liveRef.current?.startedAt || new Date().toISOString() })
-        } else {
-          await sendSignal({ type:'live-request', from:clientId })
+    signal
+      .on('broadcast', { event: 'live-signal' }, handleSignal)
+      .on('presence', { event: 'sync' }, syncLivePresence)
+      .on('presence', { event: 'join' }, syncLivePresence)
+      .on('presence', { event: 'leave' }, syncLivePresence)
+      .subscribe(async status => {
+        if (status === 'SUBSCRIBED') {
+          // Presence là nguồn trạng thái LIVE bền hơn broadcast: viewer vào sau
+          // vẫn biết host đang live. Broadcast chỉ dùng cho WebRTC signaling.
+          await signal.track({
+            clientId,
+            channelId: String(channelId),
+            role: isHostingLiveRef.current ? 'host' : 'viewer',
+            hostName: name.trim(),
+            startedAt: liveRef.current?.startedAt || null,
+            onlineAt: new Date().toISOString()
+          })
+          syncLivePresence()
+          if (!isHostingLiveRef.current) await sendSignal({ type:'live-request', from:clientId })
+          else if (liveStreamRef.current) await sendSignal({ type:'live-start', from:clientId, hostName:name.trim(), startedAt:liveRef.current?.startedAt || new Date().toISOString() })
         }
-      }
-    })
+      })
 
     return () => {
       alive = false
       if (liveSignalRef.current === signal) liveSignalRef.current = null
       supabase.removeChannel(signal)
+      pendingIceRef.clear()
       if (!isHostingLiveRef.current) { liveViewerPeerRef.current?.close(); liveViewerPeerRef.current = null; setRemoteStream(null) }
     }
   }, [joined, name, channelId])
@@ -418,6 +475,20 @@ export default function Home() {
       const startedAt = new Date().toISOString()
       const info = { hostId:getLiveClientId(), hostName:name.trim(), startedAt }
       setLive(info); setIsHostingLive(true); isHostingLiveRef.current = true; setLiveViewers(0)
+      // Cập nhật presence ngay lập tức để mọi viewer trong/đến phòng đều thấy LIVE.
+      await liveSignalRef.current?.track({
+        clientId: getLiveClientId(),
+        channelId: String(channelId),
+        role: 'host',
+        hostName: name.trim(),
+        startedAt,
+        onlineAt: new Date().toISOString()
+      })
+      await liveSignalRef.current?.send({
+        type: 'broadcast',
+        event: 'live-signal',
+        payload: { type:'live-start', from:getLiveClientId(), hostName:name.trim(), startedAt }
+      })
       requestAnimationFrame(() => { if (localVideoRef.current) { localVideoRef.current.srcObject = stream; localVideoRef.current.play?.().catch(() => {}) } })
     } catch (err) { setLiveError(err.message || 'Không thể mở camera/microphone.') }
   }
@@ -425,6 +496,7 @@ export default function Home() {
   async function stopLive() {
     if (!isHostingLive) return
     await liveSignalRef.current?.send({ type:'broadcast', event:'live-signal', payload:{ type:'live-end', from:getLiveClientId(), to:null } })
+    try { await liveSignalRef.current?.untrack() } catch {}
     closeLivePeers(); stopLiveStream(); setIsHostingLive(false); setLive(null); setLiveViewers(0)
   }
 
