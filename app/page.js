@@ -56,6 +56,8 @@ export default function Home() {
   const [liveViewers, setLiveViewers] = useState(0)
   const [liveMuted, setLiveMuted] = useState(false)
   const [liveCameraOff, setLiveCameraOff] = useState(false)
+  const [livePlaybackBlocked, setLivePlaybackBlocked] = useState(false)
+  const [liveAudioBlocked, setLiveAudioBlocked] = useState(false)
   const liveRoomRef = useRef(null)
   const liveClientIdRef = useRef(null)
   const liveSignalRef = useRef(null)
@@ -63,6 +65,7 @@ export default function Home() {
   const localVideoRef = useRef(null)
   const remoteVideoRef = useRef(null)
   const remoteVideoTrackRef = useRef(null)
+  const liveAudioElementsRef = useRef([])
   const unreadRef = useRef(0)
   const channelRef = useRef(null)
   const bottomRef = useRef(null)
@@ -89,13 +92,49 @@ export default function Home() {
   }, [isHostingLive])
 
   function getLiveClientId() {
-    if (!liveClientIdRef.current) liveClientIdRef.current = crypto.randomUUID()
+    if (!liveClientIdRef.current) {
+      try {
+        liveClientIdRef.current = crypto.randomUUID()
+      } catch {
+        liveClientIdRef.current = `u-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+      }
+    }
     return liveClientIdRef.current
   }
 
   function detachLiveTracks() {
     try { liveRoomRef.current?.localParticipant?.trackPublications?.forEach(p => p.track?.detach()) } catch {}
+    try { remoteVideoTrackRef.current?.detach?.() } catch {}
     try { remoteVideoRef.current?.srcObject && (remoteVideoRef.current.srcObject = null) } catch {}
+    try { liveAudioElementsRef.current.forEach(el => { try { el.pause?.(); el.remove?.() } catch {} }) } catch {}
+    liveAudioElementsRef.current = []
+  }
+
+  async function tryPlayLiveVideo() {
+    const video = isHostingLiveRef.current ? localVideoRef.current : remoteVideoRef.current
+    if (!video) return false
+    try {
+      video.setAttribute('playsinline', '')
+      video.setAttribute('webkit-playsinline', '')
+      video.muted = isHostingLiveRef.current
+      await video.play()
+      setLivePlaybackBlocked(false)
+      return true
+    } catch {
+      setLivePlaybackBlocked(true)
+      return false
+    }
+  }
+
+  async function enableLivePlayback() {
+    const room = liveRoomRef.current
+    try {
+      if (room && !room.canPlaybackAudio) {
+        try { await room.startAudio() } catch {}
+      }
+      setLiveAudioBlocked(false)
+    } catch {}
+    await tryPlayLiveVideo()
   }
 
   useEffect(() => {
@@ -312,7 +351,15 @@ export default function Home() {
       if (track.kind !== Track.Kind.Video) return
       remoteVideoTrackRef.current = track
       if (remoteVideoRef.current && !isHostingLiveRef.current) {
-        try { track.attach(remoteVideoRef.current) } catch {}
+        try {
+          track.attach(remoteVideoRef.current)
+          remoteVideoRef.current.muted = false
+          remoteVideoRef.current.setAttribute('playsinline', '')
+          remoteVideoRef.current.setAttribute('webkit-playsinline', '')
+          remoteVideoRef.current.play().then(() => setLivePlaybackBlocked(false)).catch(() => setLivePlaybackBlocked(true))
+        } catch {
+          setLivePlaybackBlocked(true)
+        }
       }
     }
 
@@ -338,9 +385,22 @@ export default function Home() {
         const room = new Room({ adaptiveStream: true, dynacast: true })
         liveRoomRef.current = room
         room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-          if (participant?.identity === host.hostId) attachRemoteTrack(track)
-          if (track.kind === Track.Kind.Audio) {
-            try { track.attach() } catch {}
+          if (participant?.identity === host.hostId && track.kind === Track.Kind.Video) attachRemoteTrack(track)
+          if (participant?.identity === host.hostId && track.kind === Track.Kind.Audio) {
+            try {
+              const els = track.attach() || []
+              const list = Array.isArray(els) ? els : [els]
+              list.filter(Boolean).forEach(el => {
+                el.autoplay = true
+                el.playsInline = true
+                el.setAttribute('playsinline', '')
+                document.body.appendChild(el)
+                liveAudioElementsRef.current.push(el)
+                el.play().then(() => setLiveAudioBlocked(false)).catch(() => setLiveAudioBlocked(true))
+              })
+            } catch {
+              setLiveAudioBlocked(true)
+            }
           }
         })
         room.on(RoomEvent.TrackUnsubscribed, (track) => {
@@ -353,6 +413,12 @@ export default function Home() {
             setLiveError('')
             disconnectLiveRoom()
           }
+        })
+        room.on(RoomEvent.MediaDevicesError, (error) => {
+          console.warn('Viewer media error:', error)
+        })
+        room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
+          if (!room.canPlaybackAudio && !isHostingLiveRef.current) setLiveAudioBlocked(true)
         })
         room.on(RoomEvent.Disconnected, (reason) => {
           if (!cancelled && !isHostingLiveRef.current && liveRoomRef.current === room) {
@@ -378,6 +444,24 @@ export default function Home() {
         const remoteHost = room.getParticipantByIdentity(host.hostId)
         const pub = remoteHost?.getTrackPublication(Track.Source.Camera)
         if (pub?.track) attachRemoteTrack(pub.track)
+        const micPub = remoteHost?.getTrackPublication(Track.Source.Microphone)
+        if (micPub?.track) {
+          try {
+            const els = micPub.track.attach() || []
+            const list = Array.isArray(els) ? els : [els]
+            list.filter(Boolean).forEach(el => {
+              el.autoplay = true
+              el.playsInline = true
+              el.setAttribute('playsinline', '')
+              document.body.appendChild(el)
+              liveAudioElementsRef.current.push(el)
+              el.play().then(() => setLiveAudioBlocked(false)).catch(() => setLiveAudioBlocked(true))
+            })
+          } catch {
+            setLiveAudioBlocked(true)
+          }
+        }
+        try { await room.startAudio() } catch {}
       } catch (err) {
         if (!cancelled && !isHostingLiveRef.current) {
           setLiveError(err.message || 'Không thể kết nối livestream.')
@@ -447,6 +531,8 @@ export default function Home() {
       setLive(null)
       setLiveViewers(0)
       setLiveError('')
+      setLivePlaybackBlocked(false)
+      setLiveAudioBlocked(false)
       setIsHostingLive(false)
       isHostingLiveRef.current = false
       setLiveMuted(false)
@@ -499,6 +585,16 @@ export default function Home() {
       hostRoom.on(RoomEvent.ParticipantDisconnected, () => {
         setLiveViewers(hostRoom.remoteParticipants.size)
       })
+      hostRoom.on(RoomEvent.MediaDevicesError, (error) => {
+        const message = String(error?.message || error || '')
+        if (/permission|denied|notallowed/i.test(message)) {
+          setLiveError('Điện thoại chưa cho phép Camera/Micro. Hãy bấm Cho phép khi trình duyệt hỏi quyền.')
+        } else if (/notfound|device/i.test(message)) {
+          setLiveError('Không tìm thấy camera hoặc micro trên thiết bị.')
+        } else {
+          setLiveError(`Camera/Micro lỗi: ${message || 'không xác định'}`)
+        }
+      })
       hostRoom.on(RoomEvent.Disconnected, (reason) => {
         if (isHostingLiveRef.current && String(reason || '').match(/DUPLICATE|REMOVED|ROOM_DELETED|JOIN_FAILURE/i)) {
           setLiveError(`Livestream bị ngắt (${reason}).`)
@@ -509,6 +605,8 @@ export default function Home() {
       await hostRoom.localParticipant.setCameraEnabled(true)
       await hostRoom.localParticipant.setMicrophoneEnabled(true)
 
+      setLiveAudioBlocked(false)
+      setLivePlaybackBlocked(false)
       setLive({ hostId: getLiveClientId(), hostName: name.trim(), startedAt: new Date().toISOString() })
       setIsHostingLive(true)
       isHostingLiveRef.current = true
@@ -517,7 +615,13 @@ export default function Home() {
       setLiveViewers(hostRoom.remoteParticipants.size)
 
       const pub = hostRoom.localParticipant.getTrackPublication(Track.Source.Camera)
-      if (pub?.track && localVideoRef.current) pub.track.attach(localVideoRef.current)
+      if (pub?.track && localVideoRef.current) {
+        pub.track.attach(localVideoRef.current)
+        localVideoRef.current.muted = true
+        localVideoRef.current.setAttribute('playsinline', '')
+        localVideoRef.current.setAttribute('webkit-playsinline', '')
+        try { await localVideoRef.current.play() } catch {}
+      }
 
       // Announce the live only after the host has successfully connected and
       // published media. Viewers can then join the same room without racing
@@ -566,6 +670,8 @@ export default function Home() {
     setLiveMuted(false)
     setLiveCameraOff(false)
     setLiveError('')
+    setLivePlaybackBlocked(false)
+    setLiveAudioBlocked(false)
   }
 
   function toggleLiveMute() {
@@ -836,7 +942,7 @@ export default function Home() {
     <header><div><h1>💗 Pink Chat</h1><span>{currentChannel?.name || 'Phòng chat'} • <i className={`connection-dot ${connectionStatus}`}></i>{connectionStatus==='connected'?'Đã kết nối':connectionStatus==='connecting'?'Đang kết nối...':'Mất kết nối'}</span></div><div className="header-actions"><button className="admin-btn" onClick={()=>setAdminOpen(true)}>⚙ Admin</button>{notificationPermission !== 'granted' && <button className="notify" onClick={enableNotifications}>🔔 Bật thông báo</button>}<button className="logout" onClick={logout}>Đổi tên</button></div></header>
     <section className="layout">
       <aside><h3>💬 Kênh chat</h3><div className="channels">{channels.map(c=><div className="channel-row" key={c.id}><button className={c.id===channelId?'channel active':'channel'} onClick={()=>setChannelId(c.id)}># {c.name}{unreadByChannel[String(c.id)] ? <em className="unread-badge">{unreadByChannel[String(c.id)] > 99 ? '99+' : unreadByChannel[String(c.id)]}</em> : null}</button>{adminLogged && c.name!=='Chung' && <button className="channel-delete" title="Xóa kênh" onClick={()=>deleteChannel(c)}>×</button>}</div>)}</div><h3 className="online-title">🟢 Người online <em>{online.length}</em></h3>{online.map((u,i)=><div className="user" key={u+i}><span className="user-name"><img className="avatar avatar-sm" src={avatarFor(u)} alt=""/><i/>{u}{u===name?' (Bạn)':''}</span>{adminLogged && u!==name && <button className="block-user-btn" title={`Block ${u}`} onClick={()=>blockUser(u)}>🚫 Block</button>}</div>)}{online.length===0&&<small>Đang kết nối...</small>}<div className="note">Tin nhắn được đồng bộ cho mọi người đang trong phòng.</div></aside>
-      <div className="chat">{(live || isHostingLive) && <div className="live-panel"><div className="live-panel-head"><div><b>🔴 LIVE</b><span>{isHostingLive ? `Bạn đang livestream • ${liveViewers} người xem` : `${live?.hostName || "Đang livestream"} đang phát`}</span></div><div className="live-actions">{isHostingLive ? <><button onClick={toggleLiveMute}>{liveMuted ? "🔇 Bật mic" : "🎤 Tắt mic"}</button><button onClick={toggleLiveCamera}>{liveCameraOff ? "📷 Bật cam" : "🚫 Tắt cam"}</button><button className="live-stop" onClick={stopLive}>⏹ Kết thúc</button></> : <span className="live-viewers">👁️ Đang xem</span>}</div></div><div className="live-video-wrap">{isHostingLive ? <video ref={localVideoRef} autoPlay muted playsInline className="live-video"/> : <video ref={remoteVideoRef} autoPlay playsInline className="live-video"/>}{liveError&&<div className="live-error">⚠️ {liveError}</div>}</div></div>}{!live && !isHostingLive && <button className="start-live-btn" onClick={startLive}>🔴 Livestream</button>}<div className="messages" ref={messagesBoxRef} onScroll={handleMessagesScroll}>{newMessageCount>0&&<button className="new-message-pill" onClick={jumpToLatest}>↓ {newMessageCount} tin nhắn mới</button>}{messages.length===0&&<div className="empty">Chưa có tin nhắn. Hãy bắt đầu 💬</div>}{messages.map(m=>{
+      <div className="chat">{(live || isHostingLive) && <div className="live-panel"><div className="live-panel-head"><div><b>🔴 LIVE</b><span>{isHostingLive ? `Bạn đang livestream • ${liveViewers} người xem` : `${live?.hostName || "Đang livestream"} đang phát`}</span></div><div className="live-actions">{isHostingLive ? <><button onClick={toggleLiveMute}>{liveMuted ? "🔇 Bật mic" : "🎤 Tắt mic"}</button><button onClick={toggleLiveCamera}>{liveCameraOff ? "📷 Bật cam" : "🚫 Tắt cam"}</button><button className="live-stop" onClick={stopLive}>⏹ Kết thúc</button></> : <span className="live-viewers">👁️ Đang xem</span>}</div></div><div className="live-video-wrap">{isHostingLive ? <video ref={localVideoRef} autoPlay muted playsInline webkit-playsinline="true" className="live-video"/> : <video ref={remoteVideoRef} autoPlay playsInline webkit-playsinline="true" className="live-video"/>}{!isHostingLive && (livePlaybackBlocked || liveAudioBlocked) && <button className="live-play-btn" onClick={enableLivePlayback}>▶️ Chạm để xem livestream</button>}{liveError&&<div className="live-error">⚠️ {liveError}</div>}</div></div>}{!live && !isHostingLive && <button className="start-live-btn" onClick={startLive}>🔴 Livestream</button>}<div className="messages" ref={messagesBoxRef} onScroll={handleMessagesScroll}>{newMessageCount>0&&<button className="new-message-pill" onClick={jumpToLatest}>↓ {newMessageCount} tin nhắn mới</button>}{messages.length===0&&<div className="empty">Chưa có tin nhắn. Hãy bắt đầu 💬</div>}{messages.map(m=>{
           const parent=m.reply_to ? messages.find(x=>String(x.id)===String(m.reply_to)) : null
           const rx=reactions[m.id]||[]
           const counts=rx.reduce((a,r)=>(a[r.emoji]=(a[r.emoji]||0)+1,a),{})
