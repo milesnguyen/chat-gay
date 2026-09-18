@@ -329,7 +329,7 @@ drop policy if exists "No direct session access" on public.chat_sessions;
 
 create or replace function public.register_chat_account(p_username text, p_password text)
 returns jsonb
-language plpgsql security definer set search_path=public
+language plpgsql security definer set search_path=public, extensions
 as $$
 declare a public.chat_accounts; s public.chat_sessions;
 begin
@@ -344,7 +344,7 @@ $$;
 
 create or replace function public.login_chat_account(p_username text, p_password text)
 returns jsonb
-language plpgsql security definer set search_path=public
+language plpgsql security definer set search_path=public, extensions
 as $$
 declare a public.chat_accounts; s public.chat_sessions;
 begin
@@ -359,7 +359,7 @@ $$;
 
 create or replace function public.validate_chat_session(p_token uuid)
 returns jsonb
-language plpgsql security definer set search_path=public
+language plpgsql security definer set search_path=public, extensions
 as $$
 declare u text;
 begin
@@ -375,7 +375,7 @@ grant execute on function public.validate_chat_session(uuid) to anon,authenticat
 
 -- Admin delete compatibility for existing UUID message IDs
 create or replace function public.admin_delete_message(admin_name text, admin_password text, message_id uuid)
-returns boolean language plpgsql security definer set search_path=public as $$
+returns boolean language plpgsql security definer set search_path=public, extensions as $$
 declare deleted_count integer;
 begin
   if trim(admin_name) <> 'Miles' or admin_password <> 'thinh2505' then raise exception 'Sai tài khoản hoặc mật khẩu admin'; end if;

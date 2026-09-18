@@ -27,7 +27,7 @@ drop policy if exists "No direct session access" on public.chat_sessions;
 
 create or replace function public.register_chat_account(p_username text, p_password text)
 returns jsonb
-language plpgsql security definer set search_path=public
+language plpgsql security definer set search_path=public, extensions
 as $$
 declare a public.chat_accounts; s public.chat_sessions;
 begin
@@ -42,7 +42,7 @@ $$;
 
 create or replace function public.login_chat_account(p_username text, p_password text)
 returns jsonb
-language plpgsql security definer set search_path=public
+language plpgsql security definer set search_path=public, extensions
 as $$
 declare a public.chat_accounts; s public.chat_sessions;
 begin
@@ -57,7 +57,7 @@ $$;
 
 create or replace function public.validate_chat_session(p_token uuid)
 returns jsonb
-language plpgsql security definer set search_path=public
+language plpgsql security definer set search_path=public, extensions
 as $$
 declare u text;
 begin
