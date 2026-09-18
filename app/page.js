@@ -8,6 +8,11 @@ const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || 'sb_pub
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
 const USER_KEY = 'pink-chat-user-v2'
 
+function avatarFor(userName) {
+  const seed = encodeURIComponent(String(userName || 'user').trim().toLowerCase())
+  return `https://api.dicebear.com/9.x/thumbs/svg?seed=${seed}`
+}
+
 export default function Home() {
   const [name, setName] = useState('')
   const [joined, setJoined] = useState(false)
@@ -426,12 +431,12 @@ export default function Home() {
   return <main className="app">
     <header><div><h1>💗 Pink Chat</h1><span>{currentChannel?.name || 'Phòng chat'} • Realtime</span></div><div className="header-actions"><button className="admin-btn" onClick={()=>setAdminOpen(true)}>⚙ Admin</button>{notificationPermission !== 'granted' && <button className="notify" onClick={enableNotifications}>🔔 Bật thông báo</button>}<button className="logout" onClick={logout}>Đổi tên</button></div></header>
     <section className="layout">
-      <aside><h3>💬 Kênh chat</h3><div className="channels">{channels.map(c=><div className="channel-row" key={c.id}><button className={c.id===channelId?'channel active':'channel'} onClick={()=>setChannelId(c.id)}># {c.name}</button>{adminLogged && c.name!=='Chung' && <button className="channel-delete" title="Xóa kênh" onClick={()=>deleteChannel(c)}>×</button>}</div>)}</div><h3 className="online-title">🟢 Người online <em>{online.length}</em></h3>{online.map((u,i)=><div className="user" key={u+i}><span className="user-name"><i/>{u}{u===name?' (Bạn)':''}</span>{adminLogged && u!==name && <button className="block-user-btn" title={`Block ${u}`} onClick={()=>blockUser(u)}>🚫 Block</button>}</div>)}{online.length===0&&<small>Đang kết nối...</small>}<div className="note">Tin nhắn được đồng bộ cho mọi người đang trong phòng.</div></aside>
+      <aside><h3>💬 Kênh chat</h3><div className="channels">{channels.map(c=><div className="channel-row" key={c.id}><button className={c.id===channelId?'channel active':'channel'} onClick={()=>setChannelId(c.id)}># {c.name}</button>{adminLogged && c.name!=='Chung' && <button className="channel-delete" title="Xóa kênh" onClick={()=>deleteChannel(c)}>×</button>}</div>)}</div><h3 className="online-title">🟢 Người online <em>{online.length}</em></h3>{online.map((u,i)=><div className="user" key={u+i}><span className="user-name"><img className="avatar avatar-sm" src={avatarFor(u)} alt=""/><i/>{u}{u===name?' (Bạn)':''}</span>{adminLogged && u!==name && <button className="block-user-btn" title={`Block ${u}`} onClick={()=>blockUser(u)}>🚫 Block</button>}</div>)}{online.length===0&&<small>Đang kết nối...</small>}<div className="note">Tin nhắn được đồng bộ cho mọi người đang trong phòng.</div></aside>
       <div className="chat"><div className="messages" ref={messagesBoxRef} onScroll={handleMessagesScroll}>{messages.length===0&&<div className="empty">Chưa có tin nhắn. Hãy bắt đầu 💬</div>}{messages.map(m=>{
           const parent=m.reply_to ? messages.find(x=>String(x.id)===String(m.reply_to)) : null
           const rx=reactions[m.id]||[]
           const counts=rx.reduce((a,r)=>(a[r.emoji]=(a[r.emoji]||0)+1,a),{})
-          return <div className={'msg '+(m.name===name?'mine':'')} key={m.id}><div className="bubble">
+          return <div className={'msg '+(m.name===name?'mine':'')} key={m.id}><img className="avatar avatar-msg" src={avatarFor(m.name)} alt=""/><div className="bubble">
             <b>{m.name}</b>
             {parent&&<div className="reply-preview"><strong>{parent.name}</strong>: {parent.message||'📷 Hình ảnh'}</div>}
             {m.message&&<div className="msgtext">{m.message}</div>}
