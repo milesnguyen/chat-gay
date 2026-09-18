@@ -145,8 +145,12 @@ export default function Home() {
         const ext = file.name.split('.').pop()?.toLowerCase() || 'jpg'
         const path = `${crypto.randomUUID()}.${ext}`
         const { error: uploadError } = await supabase.storage.from('images').upload(path, file, { contentType: file.type, upsert: false })
-        if (uploadError) throw uploadError
-        image_url = supabase.storage.from('images').getPublicUrl(path).data.publicUrl
+        if (uploadError) {
+          throw new Error(`Không thể tải hình lên: ${uploadError.message}. Hãy chạy phần STORAGE trong schema.sql trên Supabase.`)
+        }
+        const publicUrlResult = supabase.storage.from('images').getPublicUrl(path)
+        image_url = publicUrlResult.data.publicUrl
+        if (!image_url) throw new Error('Không lấy được URL hình ảnh.')
       }
       const { error } = await supabase.from('messages').insert({ name: name.trim(), message: text.trim() || null, image_url, channel_id: channelId, reply_to: replyTo?.id || null })
       if (error) {

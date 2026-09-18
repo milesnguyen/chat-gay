@@ -213,3 +213,29 @@ begin
     alter publication supabase_realtime add table public.message_reactions;
   end if;
 end $$;
+
+-- =========================================================
+-- STORAGE: IMAGE UPLOADS
+-- =========================================================
+
+insert into storage.buckets (id, name, public)
+values ('images', 'images', true)
+on conflict (id) do update set public = true;
+
+drop policy if exists "Anyone can upload chat images" on storage.objects;
+create policy "Anyone can upload chat images"
+on storage.objects
+for insert
+with check (bucket_id = 'images');
+
+drop policy if exists "Anyone can view chat images" on storage.objects;
+create policy "Anyone can view chat images"
+on storage.objects
+for select
+using (bucket_id = 'images');
+
+drop policy if exists "Anyone can delete chat images" on storage.objects;
+create policy "Anyone can delete chat images"
+on storage.objects
+for delete
+using (bucket_id = 'images');
