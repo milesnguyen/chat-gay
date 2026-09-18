@@ -14,6 +14,7 @@ export default function Home() {
   const [text, setText] = useState('')
   const [messages, setMessages] = useState([])
   const [online, setOnline] = useState([])
+  const presenceRef = useRef(null)
   const [channels, setChannels] = useState([])
   const [channelId, setChannelId] = useState('')
   const [file, setFile] = useState(null)
@@ -84,6 +85,37 @@ export default function Home() {
     return () => window.removeEventListener('focus', resetUnread)
   }, [])
 
+  // Global presence: danh sách người online không bị mất khi đổi kênh.
+  useEffect(() => {
+    if (!joined || !name.trim()) {
+      setOnline([])
+      return
+    }
+    const presence = supabase.channel('pink-chat-online', {
+      config: { presence: { key: name.trim().toLowerCase() } }
+    })
+    presenceRef.current = presence
+    presence
+      .on('presence', { event: 'sync' }, () => {
+        const state = presence.presenceState()
+        const all = Object.values(state).flat()
+        setOnline([...new Set(all.map(x => x.name).filter(Boolean))])
+      })
+      .subscribe(async status => {
+        if (status === 'SUBSCRIBED') {
+          await presence.track({ name: name.trim(), online_at: new Date().toISOString() })
+        }
+      })
+
+    return () => {
+      if (presenceRef.current === presence) presenceRef.current = null
+      supabase.removeChannel(presence)
+      setOnline([])
+    }
+  }, [joined, name])
+
+  // Load the selected channel. Realtime itself is kept in one stable channel below,
+  // so switching rooms never tears down the global message subscription.
   useEffect(() => {
     if (!joined || !name.trim() || !channelId) return
     let active = true
@@ -98,43 +130,56 @@ export default function Home() {
         if (active) setReactions(grouped)
       } else if (active) setReactions({})
     }
+    setMessages([])
     loadMessages()
+    // Small fallback only for recovery from a dropped Realtime connection.
+    const pollTimer = setInterval(loadMessages, 3000)
+    return () => { active = false; clearInterval(pollTimer) }
+  }, [joined, name, channelId])
 
-    // Fallback polling: if Supabase Realtime is delayed/misconfigured,
-    // other users still see new messages without refreshing the page.
-    const pollTimer = setInterval(loadMessages, 1500)
-
-    const realtime = supabase.channel(`pink-chat-${channelId}-${crypto.randomUUID()}`, { config: { presence: { key: crypto.randomUUID() }, broadcast: { self: false } } })
-    channelRef.current = realtime
-    realtime
-      .on('presence', { event: 'sync' }, () => {
-        const state = realtime.presenceState()
-        const all = Object.values(state).flat()
-        setOnline([...new Set(all.map(x => x.name).filter(Boolean))])
-        setTypingUsers([...new Set(all.filter(x => x.typing && x.name !== name).map(x => x.name))])
+  // Stable global Realtime subscription for messages/reactions.
+  // It is intentionally independent from channelId and the online-presence channel.
+  useEffect(() => {
+    if (!joined || !name.trim()) return
+    const realtime = supabase.channel('pink-chat-realtime-v3')
+    const handleMessage = payload => {
+      const msg = payload.new
+      if (!msg) return
+      setMessages(prev => {
+        if (msg.channel_id !== channelId || prev.some(m => String(m.id) === String(msg.id))) return prev
+        return [...prev, msg]
       })
-      .on('presence', { event: 'join' }, () => {})
+      if (msg.channel_id === channelId) notifyNewMessage(msg)
+    }
+    realtime
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, handleMessage)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'message_reactions' }, payload => {
+        const r = payload.new
+        setReactions(prev => ({ ...prev, [r.message_id]: [...(prev[r.message_id] || []).filter(x => !(x.name === r.name && x.emoji === r.emoji)), r] }))
+      })
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'message_reactions' }, payload => {
+        const r = payload.old
+        setReactions(prev => ({ ...prev, [r.message_id]: (prev[r.message_id] || []).filter(x => String(x.id) !== String(r.id)) }))
+      })
+      .subscribe()
+    return () => { supabase.removeChannel(realtime) }
+  }, [joined, name, channelId])
+
+  // Channel-local typing/broadcast channel. This never owns message Realtime or presence.
+  useEffect(() => {
+    if (!joined || !name.trim() || !channelId) return
+    const typingChannel = supabase.channel(`pink-chat-typing-${channelId}`, { config: { broadcast: { self: false } } })
+    channelRef.current = typingChannel
+    typingChannel
       .on('broadcast', { event: 'typing' }, ({ payload }) => {
         if (payload?.name === name) return
         setTypingUsers(prev => payload?.typing ? [...new Set([...prev, payload.name])] : prev.filter(x => x !== payload.name))
       })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `channel_id=eq.${channelId}` }, payload => {
-        setMessages(prev => prev.some(m => m.id === payload.new.id) ? prev : [...prev, payload.new])
-        notifyNewMessage(payload.new)
-      })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'message_reactions' }, payload => {
-        setReactions(prev => ({ ...prev, [payload.new.message_id]: [...(prev[payload.new.message_id] || []).filter(r => !(r.name === payload.new.name && r.emoji === payload.new.emoji)), payload.new] }))
-      })
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'message_reactions' }, payload => {
-        setReactions(prev => ({ ...prev, [payload.old.message_id]: (prev[payload.old.message_id] || []).filter(r => r.id !== payload.old.id) }))
-      })
-      .subscribe(async status => { if (status === 'SUBSCRIBED') await realtime.track({ name: name.trim(), online_at: new Date().toISOString(), typing: false }) })
-
+      .subscribe()
     return () => {
-      active = false
-      clearInterval(pollTimer)
-      supabase.removeChannel(realtime)
-      if (channelRef.current === realtime) channelRef.current = null
+      if (channelRef.current === typingChannel) channelRef.current = null
+      setTypingUsers([])
+      supabase.removeChannel(typingChannel)
     }
   }, [joined, name, channelId])
 
