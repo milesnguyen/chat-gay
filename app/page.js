@@ -150,8 +150,12 @@ export default function Home() {
             setReactions(grouped)
           }
         }
-        requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: 'auto' }))
-        shouldScrollBottomRef.current = true
+        requestAnimationFrame(() => {
+          const box = messagesBoxRef.current
+          if (box) box.scrollTop = box.scrollHeight
+          shouldScrollBottomRef.current = true
+          firstLoadRef.current = false
+        })
       }
     }
     loadMessages()
@@ -165,14 +169,24 @@ export default function Home() {
     const handleMessage = payload => {
       const msg = payload.new
       if (!msg || String(msg.channel_id) !== String(channelIdRef.current)) return
-      const box = messagesBoxRef.current
-      const nearBottom = !box || (box.scrollHeight - box.scrollTop - box.clientHeight < 100)
+      // Quyết định có tự cuộn hay không TRƯỚC khi thêm tin mới.
+      // Nếu người dùng đang đọc tin cũ thì tuyệt đối không kéo họ xuống.
+      const shouldAutoScroll = shouldScrollBottomRef.current || firstLoadRef.current
       setMessages(prev => {
         if (prev.some(m => String(m.id) === String(msg.id))) return prev
         return [...prev, msg]
       })
-      if (nearBottom || firstLoadRef.current) {
-        requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }))
+      if (shouldAutoScroll) {
+        // Chờ React render xong message rồi mới cuộn, tránh scroll trước khi
+        // scrollHeight được cập nhật khiến tin mới không xuống tới cuối.
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            const box = messagesBoxRef.current
+            if (!box) return
+            box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' })
+            shouldScrollBottomRef.current = true
+          })
+        })
       }
       notifyNewMessage(msg)
     }
