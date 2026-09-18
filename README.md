@@ -1,18 +1,15 @@
-# Pink Chat Realtime
+# Pink Chat – Core Smooth Update
 
-## 1. Supabase
-Mở SQL Editor trong project Supabase và chạy toàn bộ file `schema.sql`.
+Bản này nâng cấp phần lõi chat:
+- Realtime connection status: Đã kết nối / Đang kết nối / Mất kết nối.
+- Không polling, không reconnect realtime khi đổi kênh.
+- Unread count theo từng kênh, lưu localStorage.
+- Nút “↓ X tin nhắn mới” khi đang đọc tin cũ.
+- Tin mới chỉ tự cuộn khi người dùng đang gần cuối chat.
+- Gửi tin lỗi có nút “Thử lại”.
+- Giữ nguyên avatar, sticker, image viewer, reply, reaction và quyền admin.
 
-## 2. Environment
-Tạo `.env.local` từ `.env.local.example` và điền Publishable key.
+## Supabase
+Chạy phần SQL bổ sung ở cuối `schema.sql` nếu đang dùng RPC xóa tin cũ. Phần patch mới làm RPC `admin_delete_message` nhận ID dạng text để tương thích cả UUID và BIGINT.
 
-## 3. Vercel
-Trong Vercel Project Settings > Environment Variables, thêm:
-- NEXT_PUBLIC_SUPABASE_URL
-- NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
-
-Sau đó redeploy.
-
-
-### Thông báo tin nhắn mới
-Web hỗ trợ thông báo trình duyệt, âm thanh báo tin và số tin chưa đọc trên tiêu đề tab. Người dùng cần cấp quyền thông báo cho trình duyệt.
+Không cần chạy lại toàn bộ schema nếu database hiện tại đã hoạt động; chỉ chạy phần `FIX: Admin delete...` ở cuối file.

@@ -39,6 +39,10 @@ export default function Home() {
   const [adminBusy, setAdminBusy] = useState(false)
   const [adminPasswordSession, setAdminPasswordSession] = useState('')
   const [blockedUsers, setBlockedUsers] = useState([])
+  const [connectionStatus, setConnectionStatus] = useState('connecting')
+  const [unreadByChannel, setUnreadByChannel] = useState({})
+  const [newMessageCount, setNewMessageCount] = useState(0)
+  const [sendError, setSendError] = useState('')
   const unreadRef = useRef(0)
   const channelRef = useRef(null)
   const bottomRef = useRef(null)
@@ -49,12 +53,16 @@ export default function Home() {
   const typingTimer = useRef(null)
   const channelIdRef = useRef('')
   const firstLoadRef = useRef(true)
+  const mountedRef = useRef(false)
 
   useEffect(() => {
     const saved = localStorage.getItem(USER_KEY)
     if (saved) { setName(saved); setJoined(true) }
     if ('Notification' in window) setNotificationPermission(Notification.permission)
+    mountedRef.current = true
+    try { setUnreadByChannel(JSON.parse(localStorage.getItem('pink-chat-unread-v1') || '{}')) } catch {}
     loadChannels()
+    return () => { mountedRef.current = false }
   }, [])
 
   async function loadChannels() {
@@ -83,6 +91,14 @@ export default function Home() {
 
   function notifyNewMessage(message) {
     if (!message || message.name === name) return
+    const cid = String(message.channel_id || '')
+    const active = cid === String(channelIdRef.current)
+    const box = messagesBoxRef.current
+    const nearBottom = box ? box.scrollHeight - box.scrollTop - box.clientHeight < 120 : true
+    if (!active || !nearBottom) {
+      setUnreadByChannel(prev => { const next = {...prev, [cid]: (prev[cid] || 0) + 1}; localStorage.setItem('pink-chat-unread-v1', JSON.stringify(next)); return next })
+      if (active) setNewMessageCount(v => v + 1)
+    }
     unreadRef.current += 1; document.title = `(${unreadRef.current}) 💗 Pink Chat`; playNotificationSound()
     if (Notification.permission === 'granted') {
       const body = message.image_url ? `${message.name}: ${message.message || '📷 Đã gửi một hình ảnh'}` : `${message.name}: ${message.message || ''}`
@@ -135,6 +151,8 @@ export default function Home() {
     setMessages([])
     setReactions({})
     setTypingUsers([])
+    setNewMessageCount(0)
+    setUnreadByChannel(prev => { if (!prev[channelId]) return prev; const next={...prev}; delete next[channelId]; localStorage.setItem('pink-chat-unread-v1', JSON.stringify(next)); return next })
     shouldScrollBottomRef.current = true
     firstLoadRef.current = true
 
@@ -172,7 +190,8 @@ export default function Home() {
   // One stable Realtime connection for the whole chat. Switching channels does not reconnect it.
   useEffect(() => {
     if (!joined || !name.trim()) return
-    const realtime = supabase.channel('pink-chat-realtime-v4')
+    setConnectionStatus('connecting')
+    const realtime = supabase.channel('pink-chat-realtime-v5')
     const handleMessage = payload => {
       const msg = payload.new
       if (!msg || String(msg.channel_id) !== String(channelIdRef.current)) return
@@ -213,8 +232,11 @@ export default function Home() {
         const r = payload.old
         setReactions(prev => ({ ...prev, [r.message_id]: (prev[r.message_id] || []).filter(x => String(x.id) !== String(r.id)) }))
       })
-      .subscribe()
-    return () => { supabase.removeChannel(realtime) }
+      .subscribe(status => {
+        if (status === 'SUBSCRIBED') setConnectionStatus('connected')
+        else if (['CHANNEL_ERROR','TIMED_OUT','CLOSED'].includes(status)) setConnectionStatus('disconnected')
+      })
+    return () => { supabase.removeChannel(realtime); setConnectionStatus('disconnected') }
   }, [joined, name])
 
   // Typing indicator uses broadcast only; it is isolated per room.
@@ -238,13 +260,23 @@ export default function Home() {
 
   function handleMessagesScroll(e) {
     const el = e.currentTarget
-    shouldScrollBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100
+    shouldScrollBottomRef.current = atBottom
+    if (atBottom) setNewMessageCount(0)
     firstLoadRef.current = false
+  }
+
+  function jumpToLatest() {
+    const box = messagesBoxRef.current
+    if (!box) return
+    box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' })
+    shouldScrollBottomRef.current = true
+    setNewMessageCount(0)
   }
 
   function join(e) {
     e.preventDefault(); const n = name.trim(); if (!n) return
-    localStorage.setItem(USER_KEY, n); setName(n); setJoined(true)
+    localStorage.setItem(USER_KEY, n); setName(n); setJoined(true); setConnectionStatus('connecting')
     if (Notification.permission === 'default') enableNotifications()
   }
 
@@ -264,6 +296,7 @@ export default function Home() {
   async function send() {
     if (sending || (!text.trim() && !file) || !channelId) return
     setSending(true)
+    setSendError('')
     try {
       let image_url = null
       if (file) {
@@ -281,8 +314,13 @@ export default function Home() {
         throw error
       }
       setText(''); setFile(null); setReplyTo(null); setShowEmoji(false); if (fileInput.current) fileInput.current.value = ''
-    } catch (err) { alert(err.message || 'Gửi tin nhắn thất bại.') }
+    } catch (err) { setSendError(err.message || 'Gửi tin nhắn thất bại.') }
     finally { setSending(false) }
+  }
+
+  async function retrySend() {
+    setSendError('')
+    await send()
   }
 
   async function updateTyping(value) {
@@ -332,7 +370,7 @@ export default function Home() {
   }
 
   function logout() {
-    localStorage.removeItem(USER_KEY); setJoined(false); setName(''); setMessages([]); unreadRef.current = 0; document.title = '💗 Pink Chat'
+    localStorage.removeItem(USER_KEY); setJoined(false); setName(''); setMessages([]); setUnreadByChannel({}); localStorage.removeItem('pink-chat-unread-v1'); unreadRef.current = 0; document.title = '💗 Pink Chat'
     if (channelRef.current) supabase.removeChannel(channelRef.current)
   }
 
@@ -383,7 +421,7 @@ export default function Home() {
       const { data, error } = await supabase.rpc('admin_delete_message', {
         admin_name: 'Miles',
         admin_password: adminPasswordSession,
-        message_id: Number(messageId)
+        message_id: String(messageId)
       })
       if (error) throw error
       if (data !== true) throw new Error('Admin chưa có quyền xóa tin. Hãy chạy sticker_patch.sql trong Supabase.')
@@ -429,10 +467,10 @@ export default function Home() {
 
   const currentChannel = channels.find(c => c.id === channelId)
   return <main className="app">
-    <header><div><h1>💗 Pink Chat</h1><span>{currentChannel?.name || 'Phòng chat'} • Realtime</span></div><div className="header-actions"><button className="admin-btn" onClick={()=>setAdminOpen(true)}>⚙ Admin</button>{notificationPermission !== 'granted' && <button className="notify" onClick={enableNotifications}>🔔 Bật thông báo</button>}<button className="logout" onClick={logout}>Đổi tên</button></div></header>
+    <header><div><h1>💗 Pink Chat</h1><span>{currentChannel?.name || 'Phòng chat'} • <i className={`connection-dot ${connectionStatus}`}></i>{connectionStatus==='connected'?'Đã kết nối':connectionStatus==='connecting'?'Đang kết nối...':'Mất kết nối'}</span></div><div className="header-actions"><button className="admin-btn" onClick={()=>setAdminOpen(true)}>⚙ Admin</button>{notificationPermission !== 'granted' && <button className="notify" onClick={enableNotifications}>🔔 Bật thông báo</button>}<button className="logout" onClick={logout}>Đổi tên</button></div></header>
     <section className="layout">
-      <aside><h3>💬 Kênh chat</h3><div className="channels">{channels.map(c=><div className="channel-row" key={c.id}><button className={c.id===channelId?'channel active':'channel'} onClick={()=>setChannelId(c.id)}># {c.name}</button>{adminLogged && c.name!=='Chung' && <button className="channel-delete" title="Xóa kênh" onClick={()=>deleteChannel(c)}>×</button>}</div>)}</div><h3 className="online-title">🟢 Người online <em>{online.length}</em></h3>{online.map((u,i)=><div className="user" key={u+i}><span className="user-name"><img className="avatar avatar-sm" src={avatarFor(u)} alt=""/><i/>{u}{u===name?' (Bạn)':''}</span>{adminLogged && u!==name && <button className="block-user-btn" title={`Block ${u}`} onClick={()=>blockUser(u)}>🚫 Block</button>}</div>)}{online.length===0&&<small>Đang kết nối...</small>}<div className="note">Tin nhắn được đồng bộ cho mọi người đang trong phòng.</div></aside>
-      <div className="chat"><div className="messages" ref={messagesBoxRef} onScroll={handleMessagesScroll}>{messages.length===0&&<div className="empty">Chưa có tin nhắn. Hãy bắt đầu 💬</div>}{messages.map(m=>{
+      <aside><h3>💬 Kênh chat</h3><div className="channels">{channels.map(c=><div className="channel-row" key={c.id}><button className={c.id===channelId?'channel active':'channel'} onClick={()=>setChannelId(c.id)}># {c.name}{unreadByChannel[String(c.id)] ? <em className="unread-badge">{unreadByChannel[String(c.id)] > 99 ? '99+' : unreadByChannel[String(c.id)]}</em> : null}</button>{adminLogged && c.name!=='Chung' && <button className="channel-delete" title="Xóa kênh" onClick={()=>deleteChannel(c)}>×</button>}</div>)}</div><h3 className="online-title">🟢 Người online <em>{online.length}</em></h3>{online.map((u,i)=><div className="user" key={u+i}><span className="user-name"><img className="avatar avatar-sm" src={avatarFor(u)} alt=""/><i/>{u}{u===name?' (Bạn)':''}</span>{adminLogged && u!==name && <button className="block-user-btn" title={`Block ${u}`} onClick={()=>blockUser(u)}>🚫 Block</button>}</div>)}{online.length===0&&<small>Đang kết nối...</small>}<div className="note">Tin nhắn được đồng bộ cho mọi người đang trong phòng.</div></aside>
+      <div className="chat"><div className="messages" ref={messagesBoxRef} onScroll={handleMessagesScroll}>{newMessageCount>0&&<button className="new-message-pill" onClick={jumpToLatest}>↓ {newMessageCount} tin nhắn mới</button>}{messages.length===0&&<div className="empty">Chưa có tin nhắn. Hãy bắt đầu 💬</div>}{messages.map(m=>{
           const parent=m.reply_to ? messages.find(x=>String(x.id)===String(m.reply_to)) : null
           const rx=reactions[m.id]||[]
           const counts=rx.reduce((a,r)=>(a[r.emoji]=(a[r.emoji]||0)+1,a),{})
@@ -447,7 +485,7 @@ export default function Home() {
             <div className="msg-actions"><button onClick={()=>startReply(m)}>↩️ Reply</button>{adminLogged&&<button className="admin-delete" onClick={()=>deleteMessage(m.id)}>🗑 Xóa</button>}<button onClick={()=>toggleReaction(m.id,'❤️')}>❤️</button><button onClick={()=>toggleReaction(m.id,'😂')}>😂</button><button onClick={()=>toggleReaction(m.id,'👍')}>👍</button></div>
           </div></div>
         })}<div ref={bottomRef}/></div>
-        <div className="composer">{typingUsers.length>0&&<div className="typing">✍️ {typingUsers.join(', ')} đang nhập...</div>}{replyTo&&<div className="replying">↩️ Đang trả lời <b>{replyTo.name}</b>: {replyTo.message||'📷 Hình ảnh'}<button onClick={()=>setReplyTo(null)}>×</button></div>}{file&&<div className="preview">📷 {file.name}<button onClick={()=>{setFile(null);if(fileInput.current)fileInput.current.value='' }}>×</button></div>}<div className="row"><label className="attach">📷<input ref={fileInput} type="file" accept="image/*" onChange={chooseImage}/></label><div className="sticker-wrap"><button className="sticker-btn" onClick={()=>setShowStickers(v=>!v)}>🎟️</button>{showStickers&&<div className="sticker-picker"><div className="sticker-title">Sticker động</div><div className="sticker-grid">{[
+        <div className="composer">{sendError&&<div className="send-error">⚠️ {sendError} <button onClick={retrySend}>Thử lại</button></div>}{typingUsers.length>0&&<div className="typing">✍️ {typingUsers.join(', ')} đang nhập...</div>}{replyTo&&<div className="replying">↩️ Đang trả lời <b>{replyTo.name}</b>: {replyTo.message||'📷 Hình ảnh'}<button onClick={()=>setReplyTo(null)}>×</button></div>}{file&&<div className="preview">📷 {file.name}<button onClick={()=>{setFile(null);if(fileInput.current)fileInput.current.value='' }}>×</button></div>}<div className="row"><label className="attach">📷<input ref={fileInput} type="file" accept="image/*" onChange={chooseImage}/></label><div className="sticker-wrap"><button className="sticker-btn" onClick={()=>setShowStickers(v=>!v)}>🎟️</button>{showStickers&&<div className="sticker-picker"><div className="sticker-title">Sticker động</div><div className="sticker-grid">{[
               ['haha','😂','HAHA'],['love','🥰','LOVE'],['cry','😭','HUHU'],['angry','😡','GRR'],['wow','😮','WOW'],['ok','👍','OK'],['fire','🔥','HOT'],['heart','❤️','LOVE']
             ].map(([id,emoji,label])=><button key={id} onClick={()=>sendSticker({id,url:`/stickers/${id}.svg`})}><img src={`/stickers/${id}.svg`} alt={label}/></button>)}</div></div>}</div><div className="emoji-wrap"><button className="emoji-btn" onClick={()=>setShowEmoji(v=>!v)}>😀</button>{showEmoji&&<div className="emoji-picker">{['😀','😂','😍','🥰','😎','😮','😢','😡','👍','👎','❤️','🔥','🎉','👏','🙏','💯','🤣','😘'].map(e=><button key={e} onClick={()=>addEmoji(e)}>{e}</button>)}</div>}</div><input ref={input} value={text} onPaste={handlePaste} onChange={e=>updateTyping(e.target.value)} onKeyDown={e=>e.key==='Enter'&&!e.shiftKey&&(e.preventDefault(),send())} placeholder={`Nhắn trong #${currentChannel?.name || 'Chung'}...`}/><button disabled={sending} onClick={send}>{sending?'...':'Gửi'}</button></div></div>
       </div>

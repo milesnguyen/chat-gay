@@ -278,3 +278,25 @@ end;
 $$;
 
 grant execute on function public.admin_delete_channel(text,text,uuid) to anon, authenticated;
+
+-- ============================================================
+-- FIX: Admin delete must work with both UUID and BIGINT message IDs.
+-- Frontend sends the ID as text; PostgreSQL compares its textual form.
+-- ============================================================
+drop function if exists public.admin_delete_message(text,text,bigint);
+drop function if exists public.admin_delete_message(text,text,uuid);
+create or replace function public.admin_delete_message(admin_name text, admin_password text, message_id text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if admin_name <> 'Miles' or admin_password <> 'thinh2505' then
+    raise exception 'Sai tài khoản hoặc mật khẩu admin';
+  end if;
+  delete from public.messages where id::text = message_id;
+  return found;
+end;
+$$;
+grant execute on function public.admin_delete_message(text,text,text) to anon, authenticated;
