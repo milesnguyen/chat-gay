@@ -34,6 +34,8 @@ export default function Home() {
   const unreadRef = useRef(0)
   const channelRef = useRef(null)
   const bottomRef = useRef(null)
+  const messagesBoxRef = useRef(null)
+  const shouldScrollBottomRef = useRef(true)
   const input = useRef(null)
   const fileInput = useRef(null)
   const typingTimer = useRef(null)
@@ -120,8 +122,18 @@ export default function Home() {
     if (!joined || !name.trim() || !channelId) return
     let active = true
     async function loadMessages() {
+      const box = messagesBoxRef.current
+      const nearBottom = !box || (box.scrollHeight - box.scrollTop - box.clientHeight < 80)
       const { data, error } = await supabase.from('messages').select('*').eq('channel_id', channelId).order('created_at', { ascending: true }).limit(200)
-      if (!error && active) setMessages(data || [])
+      if (!error && active) {
+        setMessages(data || [])
+        // Chỉ tự kéo xuống khi đang ở gần cuối hoặc vừa đổi kênh.
+        shouldScrollBottomRef.current = nearBottom || shouldScrollBottomRef.current
+        if (nearBottom || shouldScrollBottomRef.current) {
+          requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: 'auto' }))
+          shouldScrollBottomRef.current = false
+        }
+      }
       const ids = (data || []).map(m => m.id)
       if (ids.length) {
         const { data: rx } = await supabase.from('message_reactions').select('*').in('message_id', ids)
@@ -131,6 +143,7 @@ export default function Home() {
       } else if (active) setReactions({})
     }
     setMessages([])
+    shouldScrollBottomRef.current = true
     loadMessages()
     // Small fallback only for recovery from a dropped Realtime connection.
     const pollTimer = setInterval(loadMessages, 3000)
@@ -145,10 +158,15 @@ export default function Home() {
     const handleMessage = payload => {
       const msg = payload.new
       if (!msg) return
+      const box = messagesBoxRef.current
+      const nearBottom = !box || (box.scrollHeight - box.scrollTop - box.clientHeight < 80)
       setMessages(prev => {
         if (msg.channel_id !== channelId || prev.some(m => String(m.id) === String(msg.id))) return prev
         return [...prev, msg]
       })
+      if (msg.channel_id === channelId && nearBottom) {
+        requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }))
+      }
       if (msg.channel_id === channelId) notifyNewMessage(msg)
     }
     realtime
@@ -183,7 +201,10 @@ export default function Home() {
     }
   }, [joined, name, channelId])
 
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+  function handleMessagesScroll(e) {
+    const el = e.currentTarget
+    shouldScrollBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  }
 
   function join(e) {
     e.preventDefault(); const n = name.trim(); if (!n) return
@@ -303,7 +324,7 @@ export default function Home() {
     <header><div><h1>💗 Pink Chat</h1><span>{currentChannel?.name || 'Phòng chat'} • Realtime</span></div><div className="header-actions"><button className="admin-btn" onClick={()=>setAdminOpen(true)}>⚙ Admin</button>{notificationPermission !== 'granted' && <button className="notify" onClick={enableNotifications}>🔔 Bật thông báo</button>}<button className="logout" onClick={logout}>Đổi tên</button></div></header>
     <section className="layout">
       <aside><h3>💬 Kênh chat</h3><div className="channels">{channels.map(c=><button key={c.id} className={c.id===channelId?'channel active':'channel'} onClick={()=>setChannelId(c.id)}># {c.name}</button>)}</div><h3 className="online-title">🟢 Người online <em>{online.length}</em></h3>{online.map((u,i)=><div className="user" key={u+i}><span className="user-name"><i/>{u}{u===name?' (Bạn)':''}</span>{adminLogged && u!==name && <button className="block-user-btn" title={`Block ${u}`} onClick={()=>blockUser(u)}>🚫 Block</button>}</div>)}{online.length===0&&<small>Đang kết nối...</small>}<div className="note">Tin nhắn được đồng bộ cho mọi người đang trong phòng.</div></aside>
-      <div className="chat"><div className="messages">{messages.length===0&&<div className="empty">Chưa có tin nhắn. Hãy bắt đầu 💬</div>}{messages.map(m=>{
+      <div className="chat"><div className="messages" ref={messagesBoxRef} onScroll={handleMessagesScroll}>{messages.length===0&&<div className="empty">Chưa có tin nhắn. Hãy bắt đầu 💬</div>}{messages.map(m=>{
           const parent=m.reply_to ? messages.find(x=>String(x.id)===String(m.reply_to)) : null
           const rx=reactions[m.id]||[]
           const counts=rx.reduce((a,r)=>(a[r.emoji]=(a[r.emoji]||0)+1,a),{})
