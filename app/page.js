@@ -22,6 +22,7 @@ export default function Home() {
   const [typingUsers, setTypingUsers] = useState([])
   const [replyTo, setReplyTo] = useState(null)
   const [showEmoji, setShowEmoji] = useState(false)
+  const [showStickers, setShowStickers] = useState(false)
   const [reactions, setReactions] = useState({})
   const [notificationPermission, setNotificationPermission] = useState('default')
   const [adminOpen, setAdminOpen] = useState(false)
@@ -193,6 +194,12 @@ export default function Home() {
     }
     realtime
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, handleMessage)
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'messages' }, payload => {
+        const deleted = payload.old
+        if (!deleted?.id) return
+        setMessages(prev => prev.filter(m => String(m.id) !== String(deleted.id)))
+        setReactions(prev => { const next = {...prev}; delete next[deleted.id]; return next })
+      })
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'message_reactions' }, payload => {
         const r = payload.new
         setReactions(prev => ({ ...prev, [r.message_id]: [...(prev[r.message_id] || []).filter(x => !(String(x.id) === String(r.id))), r] }))
@@ -234,6 +241,19 @@ export default function Home() {
     e.preventDefault(); const n = name.trim(); if (!n) return
     localStorage.setItem(USER_KEY, n); setName(n); setJoined(true)
     if (Notification.permission === 'default') enableNotifications()
+  }
+
+  async function sendSticker(sticker) {
+    if (sending || !channelId || !sticker) return
+    setSending(true)
+    try {
+      const { error } = await supabase.from('messages').insert({
+        name: name.trim(), message: null, image_url: null, sticker_url: sticker.url, message_type: 'sticker', channel_id: channelId, reply_to: replyTo?.id || null
+      })
+      if (error) throw error
+      setReplyTo(null); setShowStickers(false); setShowEmoji(false)
+    } catch (err) { alert(err.message || 'Gửi sticker thất bại.') }
+    finally { setSending(false) }
   }
 
   async function send() {
@@ -351,14 +371,24 @@ export default function Home() {
   }
 
   async function deleteMessage(messageId) {
-    if (!adminLogged || !messageId) return
+    if (!adminLogged || !messageId || adminBusy) return
     if (!window.confirm('Xóa tin nhắn này?')) return
     setAdminBusy(true)
-    const { error } = await supabase.rpc('admin_delete_message', { admin_name: 'Miles', admin_password: adminPasswordSession, message_id: Number(messageId) })
-    setAdminBusy(false)
-    if (error) return alert(error.message)
-    setMessages(prev => prev.filter(m => String(m.id) !== String(messageId)))
-    setReactions(prev => { const next = {...prev}; delete next[messageId]; return next })
+    try {
+      const { data, error } = await supabase.rpc('admin_delete_message', {
+        admin_name: 'Miles',
+        admin_password: adminPasswordSession,
+        message_id: Number(messageId)
+      })
+      if (error) throw error
+      if (data !== true) throw new Error('Admin chưa có quyền xóa tin. Hãy chạy sticker_patch.sql trong Supabase.')
+      setMessages(prev => prev.filter(m => String(m.id) !== String(messageId)))
+      setReactions(prev => { const next = {...prev}; delete next[messageId]; return next })
+    } catch (err) {
+      alert(`Xóa tin thất bại: ${err.message || err}`)
+    } finally {
+      setAdminBusy(false)
+    }
   }
 
   async function deleteChannel(channel) {
@@ -406,12 +436,15 @@ export default function Home() {
             {parent&&<div className="reply-preview"><strong>{parent.name}</strong>: {parent.message||'📷 Hình ảnh'}</div>}
             {m.message&&<div className="msgtext">{m.message}</div>}
             {m.image_url&&<img className="chat-image" src={m.image_url} alt="Ảnh" onClick={()=>setViewImage(m.image_url)} title="Bấm để xem ảnh"/>}
+            {m.message_type==='sticker'&&m.sticker_url&&<img className="chat-sticker" src={m.sticker_url} alt="Sticker" onClick={()=>setViewImage(m.sticker_url)} title="Bấm để xem sticker"/>}
             <small>{new Date(m.created_at).toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'})}</small>
             {Object.entries(counts).length>0&&<div>{Object.entries(counts).map(([emoji,count])=><button className={'reaction '+(rx.some(r=>r.name===name&&r.emoji===emoji)?'active':'')} key={emoji} onClick={()=>toggleReaction(m.id,emoji)}>{emoji} {count}</button>)}</div>}
             <div className="msg-actions"><button onClick={()=>startReply(m)}>↩️ Reply</button>{adminLogged&&<button className="admin-delete" onClick={()=>deleteMessage(m.id)}>🗑 Xóa</button>}<button onClick={()=>toggleReaction(m.id,'❤️')}>❤️</button><button onClick={()=>toggleReaction(m.id,'😂')}>😂</button><button onClick={()=>toggleReaction(m.id,'👍')}>👍</button></div>
           </div></div>
         })}<div ref={bottomRef}/></div>
-        <div className="composer">{typingUsers.length>0&&<div className="typing">✍️ {typingUsers.join(', ')} đang nhập...</div>}{replyTo&&<div className="replying">↩️ Đang trả lời <b>{replyTo.name}</b>: {replyTo.message||'📷 Hình ảnh'}<button onClick={()=>setReplyTo(null)}>×</button></div>}{file&&<div className="preview">📷 {file.name}<button onClick={()=>{setFile(null);if(fileInput.current)fileInput.current.value='' }}>×</button></div>}<div className="row"><label className="attach">📷<input ref={fileInput} type="file" accept="image/*" onChange={chooseImage}/></label><div className="emoji-wrap"><button className="emoji-btn" onClick={()=>setShowEmoji(v=>!v)}>😀</button>{showEmoji&&<div className="emoji-picker">{['😀','😂','😍','🥰','😎','😮','😢','😡','👍','👎','❤️','🔥','🎉','👏','🙏','💯','🤣','😘'].map(e=><button key={e} onClick={()=>addEmoji(e)}>{e}</button>)}</div>}</div><input ref={input} value={text} onPaste={handlePaste} onChange={e=>updateTyping(e.target.value)} onKeyDown={e=>e.key==='Enter'&&!e.shiftKey&&(e.preventDefault(),send())} placeholder={`Nhắn trong #${currentChannel?.name || 'Chung'}...`}/><button disabled={sending} onClick={send}>{sending?'...':'Gửi'}</button></div></div>
+        <div className="composer">{typingUsers.length>0&&<div className="typing">✍️ {typingUsers.join(', ')} đang nhập...</div>}{replyTo&&<div className="replying">↩️ Đang trả lời <b>{replyTo.name}</b>: {replyTo.message||'📷 Hình ảnh'}<button onClick={()=>setReplyTo(null)}>×</button></div>}{file&&<div className="preview">📷 {file.name}<button onClick={()=>{setFile(null);if(fileInput.current)fileInput.current.value='' }}>×</button></div>}<div className="row"><label className="attach">📷<input ref={fileInput} type="file" accept="image/*" onChange={chooseImage}/></label><div className="sticker-wrap"><button className="sticker-btn" onClick={()=>setShowStickers(v=>!v)}>🎟️</button>{showStickers&&<div className="sticker-picker"><div className="sticker-title">Sticker động</div><div className="sticker-grid">{[
+              ['haha','😂','HAHA'],['love','🥰','LOVE'],['cry','😭','HUHU'],['angry','😡','GRR'],['wow','😮','WOW'],['ok','👍','OK'],['fire','🔥','HOT'],['heart','❤️','LOVE']
+            ].map(([id,emoji,label])=><button key={id} onClick={()=>sendSticker({id,url:`/stickers/${id}.svg`})}><img src={`/stickers/${id}.svg`} alt={label}/></button>)}</div></div>}</div><div className="emoji-wrap"><button className="emoji-btn" onClick={()=>setShowEmoji(v=>!v)}>😀</button>{showEmoji&&<div className="emoji-picker">{['😀','😂','😍','🥰','😎','😮','😢','😡','👍','👎','❤️','🔥','🎉','👏','🙏','💯','🤣','😘'].map(e=><button key={e} onClick={()=>addEmoji(e)}>{e}</button>)}</div>}</div><input ref={input} value={text} onPaste={handlePaste} onChange={e=>updateTyping(e.target.value)} onKeyDown={e=>e.key==='Enter'&&!e.shiftKey&&(e.preventDefault(),send())} placeholder={`Nhắn trong #${currentChannel?.name || 'Chung'}...`}/><button disabled={sending} onClick={send}>{sending?'...':'Gửi'}</button></div></div>
       </div>
     </section>
 
