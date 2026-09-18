@@ -216,3 +216,65 @@ end $$;
 
 -- Đảm bảo realtime cho tin nhắn hoạt động ổn định.
 alter table public.messages replica identity full;
+
+-- ============================================================
+-- QUYỀN ADMIN NÂNG CAO: XÓA TIN, XÓA KÊNH, XEM NGƯỜI BỊ BLOCK
+-- Chạy phần này sau schema hiện tại nếu database đã có sẵn.
+-- ============================================================
+
+create or replace function public.admin_list_blocked_users(admin_name text, admin_password text)
+returns table(name text, blocked_at timestamptz)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if admin_name <> 'Miles' or admin_password <> 'thinh2505' then
+    raise exception 'Sai tài khoản hoặc mật khẩu admin';
+  end if;
+  return query
+  select b.name, b.blocked_at
+  from public.blocked_users b
+  order by b.blocked_at desc;
+end;
+$$;
+
+grant execute on function public.admin_list_blocked_users(text,text) to anon, authenticated;
+
+create or replace function public.admin_delete_message(admin_name text, admin_password text, message_id bigint)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if admin_name <> 'Miles' or admin_password <> 'thinh2505' then
+    raise exception 'Sai tài khoản hoặc mật khẩu admin';
+  end if;
+  delete from public.messages where id = message_id;
+  return found;
+end;
+$$;
+
+grant execute on function public.admin_delete_message(text,text,bigint) to anon, authenticated;
+
+create or replace function public.admin_delete_channel(admin_name text, admin_password text, channel_id uuid)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare channel_name text;
+begin
+  if admin_name <> 'Miles' or admin_password <> 'thinh2505' then
+    raise exception 'Sai tài khoản hoặc mật khẩu admin';
+  end if;
+  select name into channel_name from public.chat_channels where id = channel_id;
+  if channel_name is null then return false; end if;
+  if channel_name = 'Chung' then raise exception 'Không thể xóa kênh Chung'; end if;
+  delete from public.chat_channels where id = channel_id;
+  return found;
+end;
+$$;
+
+grant execute on function public.admin_delete_channel(text,text,uuid) to anon, authenticated;

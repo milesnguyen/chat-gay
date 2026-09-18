@@ -31,6 +31,7 @@ export default function Home() {
   const [blockName, setBlockName] = useState('')
   const [adminBusy, setAdminBusy] = useState(false)
   const [adminPasswordSession, setAdminPasswordSession] = useState('')
+  const [blockedUsers, setBlockedUsers] = useState([])
   const unreadRef = useRef(0)
   const channelRef = useRef(null)
   const bottomRef = useRef(null)
@@ -39,6 +40,8 @@ export default function Home() {
   const input = useRef(null)
   const fileInput = useRef(null)
   const typingTimer = useRef(null)
+  const channelIdRef = useRef('')
+  const firstLoadRef = useRef(true)
 
   useEffect(() => {
     const saved = localStorage.getItem(USER_KEY)
@@ -116,64 +119,68 @@ export default function Home() {
     }
   }, [joined, name])
 
-  // Load the selected channel. Realtime itself is kept in one stable channel below,
-  // so switching rooms never tears down the global message subscription.
+  // Load the selected channel once. Realtime handles new messages; no polling that can fight the user's scroll.
   useEffect(() => {
+    channelIdRef.current = channelId
     if (!joined || !name.trim() || !channelId) return
     let active = true
-    async function loadMessages() {
-      const box = messagesBoxRef.current
-      const nearBottom = !box || (box.scrollHeight - box.scrollTop - box.clientHeight < 80)
-      const { data, error } = await supabase.from('messages').select('*').eq('channel_id', channelId).order('created_at', { ascending: true }).limit(200)
-      if (!error && active) {
-        setMessages(data || [])
-        // Chỉ tự kéo xuống khi đang ở gần cuối hoặc vừa đổi kênh.
-        shouldScrollBottomRef.current = nearBottom || shouldScrollBottomRef.current
-        if (nearBottom || shouldScrollBottomRef.current) {
-          requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: 'auto' }))
-          shouldScrollBottomRef.current = false
-        }
-      }
-      const ids = (data || []).map(m => m.id)
-      if (ids.length) {
-        const { data: rx } = await supabase.from('message_reactions').select('*').in('message_id', ids)
-        const grouped = {}
-        ;(rx || []).forEach(r => { grouped[r.message_id] = [...(grouped[r.message_id] || []), r] })
-        if (active) setReactions(grouped)
-      } else if (active) setReactions({})
-    }
+
     setMessages([])
+    setReactions({})
+    setTypingUsers([])
     shouldScrollBottomRef.current = true
+    firstLoadRef.current = true
+
+    async function loadMessages() {
+      const { data, error } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('channel_id', channelId)
+        .order('created_at', { ascending: true })
+        .limit(200)
+      if (!active) return
+      if (!error) {
+        setMessages(data || [])
+        const ids = (data || []).map(m => m.id)
+        if (ids.length) {
+          const { data: rx } = await supabase.from('message_reactions').select('*').in('message_id', ids)
+          if (active) {
+            const grouped = {}
+            ;(rx || []).forEach(r => { grouped[r.message_id] = [...(grouped[r.message_id] || []), r] })
+            setReactions(grouped)
+          }
+        }
+        requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: 'auto' }))
+        shouldScrollBottomRef.current = true
+      }
+    }
     loadMessages()
-    // Small fallback only for recovery from a dropped Realtime connection.
-    const pollTimer = setInterval(loadMessages, 3000)
-    return () => { active = false; clearInterval(pollTimer) }
+    return () => { active = false }
   }, [joined, name, channelId])
 
-  // Stable global Realtime subscription for messages/reactions.
-  // It is intentionally independent from channelId and the online-presence channel.
+  // One stable Realtime connection for the whole chat. Switching channels does not reconnect it.
   useEffect(() => {
     if (!joined || !name.trim()) return
-    const realtime = supabase.channel('pink-chat-realtime-v3')
+    const realtime = supabase.channel('pink-chat-realtime-v4')
     const handleMessage = payload => {
       const msg = payload.new
-      if (!msg) return
+      if (!msg || String(msg.channel_id) !== String(channelIdRef.current)) return
       const box = messagesBoxRef.current
-      const nearBottom = !box || (box.scrollHeight - box.scrollTop - box.clientHeight < 80)
+      const nearBottom = !box || (box.scrollHeight - box.scrollTop - box.clientHeight < 100)
       setMessages(prev => {
-        if (msg.channel_id !== channelId || prev.some(m => String(m.id) === String(msg.id))) return prev
+        if (prev.some(m => String(m.id) === String(msg.id))) return prev
         return [...prev, msg]
       })
-      if (msg.channel_id === channelId && nearBottom) {
+      if (nearBottom || firstLoadRef.current) {
         requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }))
       }
-      if (msg.channel_id === channelId) notifyNewMessage(msg)
+      notifyNewMessage(msg)
     }
     realtime
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, handleMessage)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'message_reactions' }, payload => {
         const r = payload.new
-        setReactions(prev => ({ ...prev, [r.message_id]: [...(prev[r.message_id] || []).filter(x => !(x.name === r.name && x.emoji === r.emoji)), r] }))
+        setReactions(prev => ({ ...prev, [r.message_id]: [...(prev[r.message_id] || []).filter(x => !(String(x.id) === String(r.id))), r] }))
       })
       .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'message_reactions' }, payload => {
         const r = payload.old
@@ -181,21 +188,22 @@ export default function Home() {
       })
       .subscribe()
     return () => { supabase.removeChannel(realtime) }
-  }, [joined, name, channelId])
+  }, [joined, name])
 
-  // Channel-local typing/broadcast channel. This never owns message Realtime or presence.
+  // Typing indicator uses broadcast only; it is isolated per room.
   useEffect(() => {
     if (!joined || !name.trim() || !channelId) return
     const typingChannel = supabase.channel(`pink-chat-typing-${channelId}`, { config: { broadcast: { self: false } } })
     channelRef.current = typingChannel
     typingChannel
       .on('broadcast', { event: 'typing' }, ({ payload }) => {
-        if (payload?.name === name) return
-        setTypingUsers(prev => payload?.typing ? [...new Set([...prev, payload.name])] : prev.filter(x => x !== payload.name))
+        if (!payload?.name || payload.name === name) return
+        setTypingUsers(prev => payload.typing ? [...new Set([...prev, payload.name])] : prev.filter(x => x !== payload.name))
       })
       .subscribe()
     return () => {
       if (channelRef.current === typingChannel) channelRef.current = null
+      clearTimeout(typingTimer.current)
       setTypingUsers([])
       supabase.removeChannel(typingChannel)
     }
@@ -203,7 +211,8 @@ export default function Home() {
 
   function handleMessagesScroll(e) {
     const el = e.currentTarget
-    shouldScrollBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    shouldScrollBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100
+    firstLoadRef.current = false
   }
 
   function join(e) {
@@ -240,9 +249,9 @@ export default function Home() {
     setText(value)
     if (!channelRef.current) return
     clearTimeout(typingTimer.current)
-    try { await channelRef.current.track({ name: name.trim(), online_at: new Date().toISOString(), typing: true }) } catch {}
+    try { await channelRef.current.send({ type: 'broadcast', event: 'typing', payload: { name: name.trim(), typing: true } }) } catch {}
     typingTimer.current = setTimeout(async () => {
-      try { await channelRef.current.track({ name: name.trim(), online_at: new Date().toISOString(), typing: false }) } catch {}
+      try { await channelRef.current?.send({ type: 'broadcast', event: 'typing', payload: { name: name.trim(), typing: false } }) } catch {}
     }, 1200)
   }
 
@@ -295,6 +304,8 @@ export default function Home() {
     setAdminBusy(false)
     if (error || !data) return alert('Sai mật khẩu admin.')
     setAdminLogged(true); setAdminPasswordSession(adminPass); setAdminPass('')
+    const { data: blocked } = await supabase.rpc('admin_list_blocked_users', { admin_name: 'Miles', admin_password: adminPass })
+    setBlockedUsers(blocked || [])
     alert('Đăng nhập admin thành công.')
   }
 
@@ -305,6 +316,46 @@ export default function Home() {
     setAdminBusy(false)
     if (error) return alert(error.message)
     setNewChannel(''); await loadChannels(); if (data?.id) setChannelId(data.id); alert('Đã tạo kênh mới.')
+  }
+
+  async function loadBlockedUsers() {
+    if (!adminLogged) return
+    const { data, error } = await supabase.rpc('admin_list_blocked_users', { admin_name: 'Miles', admin_password: adminPasswordSession })
+    if (!error) setBlockedUsers(data || [])
+  }
+
+  async function unblockUser(targetName) {
+    const n = String(targetName || '').trim(); if (!n || !adminLogged) return
+    if (!window.confirm(`Bỏ block ${n}?`)) return
+    setAdminBusy(true)
+    const { error } = await supabase.rpc('admin_unblock_user', { admin_name: 'Miles', admin_password: adminPasswordSession, user_name: n })
+    setAdminBusy(false)
+    if (error) return alert(error.message)
+    await loadBlockedUsers()
+    alert(`Đã bỏ block ${n}.`)
+  }
+
+  async function deleteMessage(messageId) {
+    if (!adminLogged || !messageId) return
+    if (!window.confirm('Xóa tin nhắn này?')) return
+    setAdminBusy(true)
+    const { error } = await supabase.rpc('admin_delete_message', { admin_name: 'Miles', admin_password: adminPasswordSession, message_id: Number(messageId) })
+    setAdminBusy(false)
+    if (error) return alert(error.message)
+    setMessages(prev => prev.filter(m => String(m.id) !== String(messageId)))
+    setReactions(prev => { const next = {...prev}; delete next[messageId]; return next })
+  }
+
+  async function deleteChannel(channel) {
+    if (!adminLogged || !channel) return
+    if (channel.name === 'Chung') return alert('Không thể xóa kênh Chung.')
+    if (!window.confirm(`Xóa kênh #${channel.name} và toàn bộ tin nhắn trong kênh?`)) return
+    setAdminBusy(true)
+    const { error } = await supabase.rpc('admin_delete_channel', { admin_name: 'Miles', admin_password: adminPasswordSession, channel_id: channel.id })
+    setAdminBusy(false)
+    if (error) return alert(error.message)
+    await loadChannels()
+    alert(`Đã xóa kênh #${channel.name}.`)
   }
 
   async function blockUser(targetName = blockName) {
@@ -323,7 +374,7 @@ export default function Home() {
   return <main className="app">
     <header><div><h1>💗 Pink Chat</h1><span>{currentChannel?.name || 'Phòng chat'} • Realtime</span></div><div className="header-actions"><button className="admin-btn" onClick={()=>setAdminOpen(true)}>⚙ Admin</button>{notificationPermission !== 'granted' && <button className="notify" onClick={enableNotifications}>🔔 Bật thông báo</button>}<button className="logout" onClick={logout}>Đổi tên</button></div></header>
     <section className="layout">
-      <aside><h3>💬 Kênh chat</h3><div className="channels">{channels.map(c=><button key={c.id} className={c.id===channelId?'channel active':'channel'} onClick={()=>setChannelId(c.id)}># {c.name}</button>)}</div><h3 className="online-title">🟢 Người online <em>{online.length}</em></h3>{online.map((u,i)=><div className="user" key={u+i}><span className="user-name"><i/>{u}{u===name?' (Bạn)':''}</span>{adminLogged && u!==name && <button className="block-user-btn" title={`Block ${u}`} onClick={()=>blockUser(u)}>🚫 Block</button>}</div>)}{online.length===0&&<small>Đang kết nối...</small>}<div className="note">Tin nhắn được đồng bộ cho mọi người đang trong phòng.</div></aside>
+      <aside><h3>💬 Kênh chat</h3><div className="channels">{channels.map(c=><div className="channel-row" key={c.id}><button className={c.id===channelId?'channel active':'channel'} onClick={()=>setChannelId(c.id)}># {c.name}</button>{adminLogged && c.name!=='Chung' && <button className="channel-delete" title="Xóa kênh" onClick={()=>deleteChannel(c)}>×</button>}</div>)}</div><h3 className="online-title">🟢 Người online <em>{online.length}</em></h3>{online.map((u,i)=><div className="user" key={u+i}><span className="user-name"><i/>{u}{u===name?' (Bạn)':''}</span>{adminLogged && u!==name && <button className="block-user-btn" title={`Block ${u}`} onClick={()=>blockUser(u)}>🚫 Block</button>}</div>)}{online.length===0&&<small>Đang kết nối...</small>}<div className="note">Tin nhắn được đồng bộ cho mọi người đang trong phòng.</div></aside>
       <div className="chat"><div className="messages" ref={messagesBoxRef} onScroll={handleMessagesScroll}>{messages.length===0&&<div className="empty">Chưa có tin nhắn. Hãy bắt đầu 💬</div>}{messages.map(m=>{
           const parent=m.reply_to ? messages.find(x=>String(x.id)===String(m.reply_to)) : null
           const rx=reactions[m.id]||[]
@@ -335,13 +386,13 @@ export default function Home() {
             {m.image_url&&<img src={m.image_url} alt="Ảnh"/>}
             <small>{new Date(m.created_at).toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'})}</small>
             {Object.entries(counts).length>0&&<div>{Object.entries(counts).map(([emoji,count])=><button className={'reaction '+(rx.some(r=>r.name===name&&r.emoji===emoji)?'active':'')} key={emoji} onClick={()=>toggleReaction(m.id,emoji)}>{emoji} {count}</button>)}</div>}
-            <div className="msg-actions"><button onClick={()=>startReply(m)}>↩️ Reply</button><button onClick={()=>toggleReaction(m.id,'❤️')}>❤️</button><button onClick={()=>toggleReaction(m.id,'😂')}>😂</button><button onClick={()=>toggleReaction(m.id,'👍')}>👍</button></div>
+            <div className="msg-actions"><button onClick={()=>startReply(m)}>↩️ Reply</button>{adminLogged&&<button className="admin-delete" onClick={()=>deleteMessage(m.id)}>🗑 Xóa</button>}<button onClick={()=>toggleReaction(m.id,'❤️')}>❤️</button><button onClick={()=>toggleReaction(m.id,'😂')}>😂</button><button onClick={()=>toggleReaction(m.id,'👍')}>👍</button></div>
           </div></div>
         })}<div ref={bottomRef}/></div>
         <div className="composer">{typingUsers.length>0&&<div className="typing">✍️ {typingUsers.join(', ')} đang nhập...</div>}{replyTo&&<div className="replying">↩️ Đang trả lời <b>{replyTo.name}</b>: {replyTo.message||'📷 Hình ảnh'}<button onClick={()=>setReplyTo(null)}>×</button></div>}{file&&<div className="preview">📷 {file.name}<button onClick={()=>{setFile(null);if(fileInput.current)fileInput.current.value='' }}>×</button></div>}<div className="row"><label className="attach">📷<input ref={fileInput} type="file" accept="image/*" onChange={chooseImage}/></label><div className="emoji-wrap"><button className="emoji-btn" onClick={()=>setShowEmoji(v=>!v)}>😀</button>{showEmoji&&<div className="emoji-picker">{['😀','😂','😍','🥰','😎','😮','😢','😡','👍','👎','❤️','🔥','🎉','👏','🙏','💯','🤣','😘'].map(e=><button key={e} onClick={()=>addEmoji(e)}>{e}</button>)}</div>}</div><input ref={input} value={text} onPaste={handlePaste} onChange={e=>updateTyping(e.target.value)} onKeyDown={e=>e.key==='Enter'&&!e.shiftKey&&(e.preventDefault(),send())} placeholder={`Nhắn trong #${currentChannel?.name || 'Chung'}...`}/><button disabled={sending} onClick={send}>{sending?'...':'Gửi'}</button></div></div>
       </div>
     </section>
 
-    {adminOpen && <div className="modal-backdrop" onClick={()=>setAdminOpen(false)}><div className="admin-modal" onClick={e=>e.stopPropagation()}><div className="admin-head"><h2>⚙ Quản lý Admin</h2><button onClick={()=>setAdminOpen(false)}>×</button></div>{!adminLogged ? <form onSubmit={adminLogin}><p>Đăng nhập bằng tài khoản admin.</p><input value="Miles" readOnly/><input type="password" value={adminPass} onChange={e=>setAdminPass(e.target.value)} placeholder="Mật khẩu" autoFocus/><button disabled={adminBusy}>Đăng nhập</button></form> : <div className="admin-tools"><div><h3>➕ Tạo kênh mới</h3><div className="admin-row"><input value={newChannel} onChange={e=>setNewChannel(e.target.value)} placeholder="Tên kênh" maxLength={40}/><button disabled={adminBusy} onClick={createChannel}>Tạo</button></div></div><div className="admin-info">🚫 Muốn block spam, bấm <b>🚫 Block</b> ngay bên cạnh tên người trong danh sách online.</div><small>Admin: Miles</small></div>}</div></div>}
+    {adminOpen && <div className="modal-backdrop" onClick={()=>setAdminOpen(false)}><div className="admin-modal" onClick={e=>e.stopPropagation()}><div className="admin-head"><h2>⚙ Quản lý Admin</h2><button onClick={()=>setAdminOpen(false)}>×</button></div>{!adminLogged ? <form onSubmit={adminLogin}><p>Đăng nhập bằng tài khoản admin.</p><input value="Miles" readOnly/><input type="password" value={adminPass} onChange={e=>setAdminPass(e.target.value)} placeholder="Mật khẩu" autoFocus/><button disabled={adminBusy}>Đăng nhập</button></form> : <div className="admin-tools"><div><h3>➕ Tạo kênh mới</h3><div className="admin-row"><input value={newChannel} onChange={e=>setNewChannel(e.target.value)} placeholder="Tên kênh" maxLength={40}/><button disabled={adminBusy} onClick={createChannel}>Tạo</button></div></div><div><h3>🚫 Quản lý người bị block</h3>{blockedUsers.length===0?<div className="admin-empty">Chưa có ai bị block.</div>:<div className="blocked-list">{blockedUsers.map((u,i)=>{const n=typeof u==='string'?u:(u.name||u.user_name||'');return <div className="blocked-item" key={n+i}><span>🚫 {n}</span><button disabled={adminBusy} onClick={()=>unblockUser(n)}>Bỏ block</button></div>})}</div>}</div><div className="admin-info">Quyền admin: tạo/xóa kênh, block/bỏ block người dùng và xóa tin nhắn.</div><small>Admin: Miles</small></div>}</div></div>}
   </main>
 }
