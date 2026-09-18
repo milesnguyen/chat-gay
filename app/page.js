@@ -25,6 +25,7 @@ export default function Home() {
   const [reactions, setReactions] = useState({})
   const [notificationPermission, setNotificationPermission] = useState('default')
   const [adminOpen, setAdminOpen] = useState(false)
+  const [viewImage, setViewImage] = useState(null)
   const [adminLogged, setAdminLogged] = useState(false)
   const [adminPass, setAdminPass] = useState('')
   const [newChannel, setNewChannel] = useState('')
@@ -382,6 +383,13 @@ export default function Home() {
     setBlockName(''); alert(`Đã block ${n}. Người này sẽ không gửi được tin nhắn nữa.`)
   }
 
+  useEffect(() => {
+    if (!viewImage) return
+    const onKey = e => { if (e.key === 'Escape') setViewImage(null) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [viewImage])
+
   if (!joined) return <main className="login"><div className="card"><div className="logo">💗</div><h1>Pink Chat</h1><p>Nhập tên để tham gia phòng chat</p><form onSubmit={join}><input autoFocus value={name} onChange={e=>setName(e.target.value)} placeholder="Tên của bạn" maxLength={30}/><button>Vào chat</button></form></div></main>
 
   const currentChannel = channels.find(c => c.id === channelId)
@@ -397,7 +405,7 @@ export default function Home() {
             <b>{m.name}</b>
             {parent&&<div className="reply-preview"><strong>{parent.name}</strong>: {parent.message||'📷 Hình ảnh'}</div>}
             {m.message&&<div className="msgtext">{m.message}</div>}
-            {m.image_url&&<img src={m.image_url} alt="Ảnh"/>}
+            {m.image_url&&<img className="chat-image" src={m.image_url} alt="Ảnh" onClick={()=>setViewImage(m.image_url)} title="Bấm để xem ảnh"/>}
             <small>{new Date(m.created_at).toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'})}</small>
             {Object.entries(counts).length>0&&<div>{Object.entries(counts).map(([emoji,count])=><button className={'reaction '+(rx.some(r=>r.name===name&&r.emoji===emoji)?'active':'')} key={emoji} onClick={()=>toggleReaction(m.id,emoji)}>{emoji} {count}</button>)}</div>}
             <div className="msg-actions"><button onClick={()=>startReply(m)}>↩️ Reply</button>{adminLogged&&<button className="admin-delete" onClick={()=>deleteMessage(m.id)}>🗑 Xóa</button>}<button onClick={()=>toggleReaction(m.id,'❤️')}>❤️</button><button onClick={()=>toggleReaction(m.id,'😂')}>😂</button><button onClick={()=>toggleReaction(m.id,'👍')}>👍</button></div>
@@ -406,6 +414,8 @@ export default function Home() {
         <div className="composer">{typingUsers.length>0&&<div className="typing">✍️ {typingUsers.join(', ')} đang nhập...</div>}{replyTo&&<div className="replying">↩️ Đang trả lời <b>{replyTo.name}</b>: {replyTo.message||'📷 Hình ảnh'}<button onClick={()=>setReplyTo(null)}>×</button></div>}{file&&<div className="preview">📷 {file.name}<button onClick={()=>{setFile(null);if(fileInput.current)fileInput.current.value='' }}>×</button></div>}<div className="row"><label className="attach">📷<input ref={fileInput} type="file" accept="image/*" onChange={chooseImage}/></label><div className="emoji-wrap"><button className="emoji-btn" onClick={()=>setShowEmoji(v=>!v)}>😀</button>{showEmoji&&<div className="emoji-picker">{['😀','😂','😍','🥰','😎','😮','😢','😡','👍','👎','❤️','🔥','🎉','👏','🙏','💯','🤣','😘'].map(e=><button key={e} onClick={()=>addEmoji(e)}>{e}</button>)}</div>}</div><input ref={input} value={text} onPaste={handlePaste} onChange={e=>updateTyping(e.target.value)} onKeyDown={e=>e.key==='Enter'&&!e.shiftKey&&(e.preventDefault(),send())} placeholder={`Nhắn trong #${currentChannel?.name || 'Chung'}...`}/><button disabled={sending} onClick={send}>{sending?'...':'Gửi'}</button></div></div>
       </div>
     </section>
+
+    {viewImage && <div className="image-lightbox" onClick={()=>setViewImage(null)}><button className="image-lightbox-close" onClick={()=>setViewImage(null)} aria-label="Đóng">×</button><img src={viewImage} alt="Xem ảnh" onClick={e=>e.stopPropagation()}/></div>}
 
     {adminOpen && <div className="modal-backdrop" onClick={()=>setAdminOpen(false)}><div className="admin-modal" onClick={e=>e.stopPropagation()}><div className="admin-head"><h2>⚙ Quản lý Admin</h2><button onClick={()=>setAdminOpen(false)}>×</button></div>{!adminLogged ? <form onSubmit={adminLogin}><p>Đăng nhập bằng tài khoản admin.</p><input value="Miles" readOnly/><input type="password" value={adminPass} onChange={e=>setAdminPass(e.target.value)} placeholder="Mật khẩu" autoFocus/><button disabled={adminBusy}>Đăng nhập</button></form> : <div className="admin-tools"><div><h3>➕ Tạo kênh mới</h3><div className="admin-row"><input value={newChannel} onChange={e=>setNewChannel(e.target.value)} placeholder="Tên kênh" maxLength={40}/><button disabled={adminBusy} onClick={createChannel}>Tạo</button></div></div><div><h3>🚫 Quản lý người bị block</h3>{blockedUsers.length===0?<div className="admin-empty">Chưa có ai bị block.</div>:<div className="blocked-list">{blockedUsers.map((u,i)=>{const n=typeof u==='string'?u:(u.name||u.user_name||'');return <div className="blocked-item" key={n+i}><span>🚫 {n}</span><button disabled={adminBusy} onClick={()=>unblockUser(n)}>Bỏ block</button></div>})}</div>}</div><div className="admin-info">Quyền admin: tạo/xóa kênh, block/bỏ block người dùng và xóa tin nhắn.</div><small>Admin: Miles</small></div>}</div></div>}
   </main>
