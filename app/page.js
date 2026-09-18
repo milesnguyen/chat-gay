@@ -339,9 +339,19 @@ export default function Home() {
       if (!alive || !payload || (payload.to && payload.to !== clientId)) return
       try {
         if (payload.type === 'live-start') {
-          setLive({ hostId: payload.from, hostName: payload.hostName, startedAt: payload.startedAt })
-          setLiveError('')
-          if (payload.from !== clientId && !isHostingLiveRef.current) await sendSignal({ type:'viewer-join', from:clientId, to:payload.from })
+          // Nhận thông báo live từ host, kể cả khi viewer đã ở trong phòng từ trước.
+          if (payload.from !== clientId) {
+            setLive({ hostId: payload.from, hostName: payload.hostName, startedAt: payload.startedAt })
+            setLiveError('')
+            if (!isHostingLiveRef.current) await sendSignal({ type:'viewer-join', from:clientId, to:payload.from })
+          }
+          return
+        }
+        if (payload.type === 'live-request') {
+          // Viewer vào phòng sau khi host đã bắt đầu live sẽ yêu cầu host gửi lại trạng thái.
+          if (isHostingLiveRef.current && payload.from !== clientId) {
+            await sendSignal({ type:'live-start', from:clientId, hostName:name.trim(), startedAt:liveRef.current?.startedAt || new Date().toISOString(), to:payload.from })
+          }
           return
         }
         if (payload.type === 'live-end') {
@@ -379,8 +389,14 @@ export default function Home() {
     }
 
     signal.on('broadcast', { event: 'live-signal' }, handleSignal).subscribe(async status => {
-      if (status === 'SUBSCRIBED' && isHostingLiveRef.current && liveStreamRef.current) {
-        await sendSignal({ type:'live-start', from:clientId, hostName:name.trim(), startedAt:liveRef.current?.startedAt || new Date().toISOString() })
+      if (status === 'SUBSCRIBED') {
+        // Host thông báo live ngay khi kết nối signaling; viewer mới vào phòng sẽ
+        // gửi live-request để nhận lại thông báo và sau đó tạo WebRTC peer.
+        if (isHostingLiveRef.current && liveStreamRef.current) {
+          await sendSignal({ type:'live-start', from:clientId, hostName:name.trim(), startedAt:liveRef.current?.startedAt || new Date().toISOString() })
+        } else {
+          await sendSignal({ type:'live-request', from:clientId })
+        }
       }
     })
 
@@ -689,7 +705,13 @@ export default function Home() {
             {m.image_url&&<img className="chat-image" src={m.image_url} alt="Ảnh" onClick={()=>setViewImage(m.image_url)} title="Bấm để xem ảnh"/>}
             {m.message_type==='sticker'&&m.sticker_url&&<img className="chat-sticker" src={m.sticker_url} alt="Sticker" onClick={()=>setViewImage(m.sticker_url)} title="Bấm để xem sticker"/>}
             <small>{new Date(m.created_at).toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'})}</small>
-            {Object.entries(counts).length>0&&<div>{Object.entries(counts).map(([emoji,count])=><button className={'reaction '+(rx.some(r=>r.name===name&&r.emoji===emoji)?'active':'')} key={emoji} onClick={()=>toggleReaction(m.id,emoji)}>{emoji} {count}</button>)}</div>}
+            {Object.entries(counts).length>0&&<div className="reaction-list">{Object.entries(counts).map(([emoji,count])=>{
+              const reactors=[...new Set(rx.filter(r=>r.emoji===emoji).map(r=>r.name).filter(Boolean))]
+              return <div className="reaction-wrap" key={emoji}>
+                <button className={'reaction '+(rx.some(r=>r.name===name&&r.emoji===emoji)?'active':'')} onClick={()=>toggleReaction(m.id,emoji)} aria-label={`${emoji} ${count} người`}>{emoji} {count}</button>
+                <div className="reaction-tooltip">{reactors.map((n,i)=><div key={n+i}><b>{n}</b> <span>{emoji}</span></div>)}</div>
+              </div>
+            })}</div>}
             <div className="msg-actions"><button onClick={()=>startReply(m)}>↩️ Reply</button>{adminLogged&&<button className="admin-delete" onClick={()=>deleteMessage(m.id)}>🗑 Xóa</button>}<button onClick={()=>toggleReaction(m.id,'❤️')}>❤️</button><button onClick={()=>toggleReaction(m.id,'😂')}>😂</button><button onClick={()=>toggleReaction(m.id,'👍')}>👍</button></div>
           </div></div>
         })}<div ref={bottomRef}/></div>
