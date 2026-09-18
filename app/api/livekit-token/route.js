@@ -20,6 +20,7 @@ export async function POST(request) {
         identity: String(identity),
         name: String(name || identity),
         ttl: '6h',
+        metadata: host ? 'pink-chat-host' : '',
       }
     )
 

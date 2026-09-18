@@ -60,6 +60,7 @@ export default function Home() {
   const liveClientIdRef = useRef(null)
   const localVideoRef = useRef(null)
   const remoteVideoRef = useRef(null)
+  const remoteVideoTrackRef = useRef(null)
   const unreadRef = useRef(0)
   const channelRef = useRef(null)
   const bottomRef = useRef(null)
@@ -286,118 +287,196 @@ export default function Home() {
   }, [joined, name])
 
   // LiveKit server-side livestream. One room per chat channel.
+  // Users initially join as viewers. When the current user starts a live,
+  // we reconnect that client with a host token so it is allowed to publish.
   useEffect(() => {
     if (!joined || !name.trim() || !channelId) return
     let cancelled = false
-    const room = new Room({ adaptiveStream: true, dynacast: true })
-    liveRoomRef.current = room
+    let room = null
+
+    const roomName = `pink-chat-${channelId}`
 
     const updateViewers = () => {
-      const count = Array.from(room.remoteParticipants.values()).length
-      setLiveViewers(count)
+      if (!room) return
+      setLiveViewers(Array.from(room.remoteParticipants.values()).length)
     }
 
-    const onTrackSubscribed = (track) => {
-      if (track.kind === Track.Kind.Video && remoteVideoRef.current) track.attach(remoteVideoRef.current)
-      if (track.kind === Track.Kind.Audio) track.attach()
+    const findHost = () => {
+      if (!room) return null
+      return Array.from(room.remoteParticipants.values()).find(p => p.metadata === 'pink-chat-host') || null
     }
-    const onTrackUnsubscribed = (track) => { try { track.detach() } catch {} }
-    const onParticipantConnected = updateViewers
-    const onParticipantDisconnected = updateViewers
 
-    room.on(RoomEvent.TrackSubscribed, onTrackSubscribed)
-    room.on(RoomEvent.TrackUnsubscribed, onTrackUnsubscribed)
-    room.on(RoomEvent.ParticipantConnected, onParticipantConnected)
-    room.on(RoomEvent.ParticipantDisconnected, onParticipantDisconnected)
-
-    async function joinLiveRoomIfNeeded() {
-      try {
-        const res = await fetch('/api/livekit-token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            roomName: `pink-chat-${channelId}`,
-            identity: getLiveClientId(),
-            name: name.trim(),
-            host: false
-          })
+    const syncParticipants = () => {
+      if (!room) return
+      const participants = Array.from(room.remoteParticipants.values())
+      const host = findHost()
+      if (host) {
+        setLive(prev => prev || {
+          hostId: host.identity,
+          hostName: host.name || host.identity,
+          startedAt: new Date().toISOString()
         })
-        const data = await res.json()
-        if (!res.ok) throw new Error(data.error || 'Không thể lấy token livestream.')
-        await room.connect(data.url, data.token)
-        if (cancelled) return
-        updateViewers()
-      } catch (err) {
-        if (!cancelled) console.warn('LiveKit viewer connection:', err)
+        setLiveError('')
+      } else if (!isHostingLiveRef.current) {
+        setLive(null)
+      }
+      setLiveViewers(participants.length)
+
+      const pub = host?.getTrackPublication(Track.Source.Camera)
+      if (pub?.track) {
+        remoteVideoTrackRef.current = pub.track
+        if (remoteVideoRef.current) pub.track.attach(remoteVideoRef.current)
       }
     }
 
-    // Join the room in viewer mode so the app can discover an active host.
-    joinLiveRoomIfNeeded()
+    const onTrackSubscribed = (track, publication, participant) => {
+      if (track.kind === Track.Kind.Video) {
+        remoteVideoTrackRef.current = track
+        if (remoteVideoRef.current) track.attach(remoteVideoRef.current)
+        if (participant?.metadata === 'pink-chat-host') {
+          setLive(prev => prev || {
+            hostId: participant.identity,
+            hostName: participant.name || participant.identity,
+            startedAt: new Date().toISOString()
+          })
+        }
+      }
+      if (track.kind === Track.Kind.Audio) track.attach()
+    }
+
+    const onTrackUnsubscribed = (track) => {
+      try { track.detach() } catch {}
+      if (remoteVideoTrackRef.current === track) remoteVideoTrackRef.current = null
+    }
+
+    const onParticipantConnected = () => {
+      updateViewers()
+      syncParticipants()
+    }
+
+    const onParticipantDisconnected = () => {
+      updateViewers()
+      syncParticipants()
+    }
+
+    const onParticipantMetadataChanged = () => syncParticipants()
+
+    async function connectAsViewer() {
+      const res = await fetch('/api/livekit-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomName,
+          identity: getLiveClientId(),
+          name: name.trim(),
+          host: false
+        })
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Không thể lấy token livestream.')
+
+      room = new Room({ adaptiveStream: true, dynacast: true })
+      liveRoomRef.current = room
+      room.on(RoomEvent.TrackSubscribed, onTrackSubscribed)
+      room.on(RoomEvent.TrackUnsubscribed, onTrackUnsubscribed)
+      room.on(RoomEvent.ParticipantConnected, onParticipantConnected)
+      room.on(RoomEvent.ParticipantDisconnected, onParticipantDisconnected)
+      room.on(RoomEvent.ParticipantMetadataChanged, onParticipantMetadataChanged)
+      await room.connect(data.url, data.token)
+      if (cancelled) return
+      syncParticipants()
+    }
+
+    connectAsViewer().catch(err => {
+      if (!cancelled) setLiveError(err.message || 'Không thể kết nối livestream.')
+    })
 
     return () => {
       cancelled = true
-      room.off(RoomEvent.TrackSubscribed, onTrackSubscribed)
-      room.off(RoomEvent.TrackUnsubscribed, onTrackUnsubscribed)
-      room.off(RoomEvent.ParticipantConnected, onParticipantConnected)
-      room.off(RoomEvent.ParticipantDisconnected, onParticipantDisconnected)
-      try {
-        room.localParticipant.setCameraEnabled(false)
-        room.localParticipant.setMicrophoneEnabled(false)
-      } catch {}
-      try { room.disconnect() } catch {}
+      if (room) {
+        room.off(RoomEvent.TrackSubscribed, onTrackSubscribed)
+        room.off(RoomEvent.TrackUnsubscribed, onTrackUnsubscribed)
+        room.off(RoomEvent.ParticipantConnected, onParticipantConnected)
+        room.off(RoomEvent.ParticipantDisconnected, onParticipantDisconnected)
+        room.off(RoomEvent.ParticipantMetadataChanged, onParticipantMetadataChanged)
+        try { room.disconnect() } catch {}
+      }
       if (liveRoomRef.current === room) liveRoomRef.current = null
+      remoteVideoTrackRef.current = null
+      try { if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null } catch {}
       setLiveViewers(0)
       setLive(null)
       setIsHostingLive(false)
       isHostingLiveRef.current = false
       setLiveMuted(false)
       setLiveCameraOff(false)
-      try { if (localVideoRef.current) localVideoRef.current.srcObject = null } catch {}
-      try { if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null } catch {}
     }
   }, [joined, name, channelId])
 
-  // Detect a host joining/leaving and subscribe to their published tracks.
+  // Attach a remote video track again after React has rendered the video element.
   useEffect(() => {
-    const room = liveRoomRef.current
-    if (!room || !joined || !channelId) return
-    const syncParticipants = () => {
-      const participants = Array.from(room.remoteParticipants.values())
-      const host = participants.find(p => p.metadata === 'pink-chat-host' || p.name === live?.hostName)
-      if (host) {
-        setLive(prev => prev || { hostId: host.identity, hostName: host.name || host.identity, startedAt: new Date().toISOString() })
-        setLiveError('')
-      } else if (!isHostingLiveRef.current) {
-        setLive(null)
-      }
-      setLiveViewers(participants.length)
+    const track = remoteVideoTrackRef.current
+    if (track && remoteVideoRef.current && !isHostingLive) {
+      try { track.attach(remoteVideoRef.current) } catch {}
     }
-    syncParticipants()
-    const timer = setInterval(syncParticipants, 1000)
-    return () => clearInterval(timer)
-  }, [joined, channelId, live?.hostName])
+  }, [live, isHostingLive])
+
+  async function getLiveKitToken(host) {
+    const res = await fetch('/api/livekit-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        roomName: `pink-chat-${channelId}`,
+        identity: getLiveClientId(),
+        name: name.trim(),
+        host
+      })
+    })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || 'Không thể lấy token livestream.')
+    return data
+  }
 
   async function startLive() {
     if (!channelId || isHostingLive) return
     setLiveError('')
+    let hostRoom = null
     try {
-      const room = liveRoomRef.current
-      if (!room || room.state !== 'connected') throw new Error('Livestream chưa kết nối server. Hãy thử lại.')
-      await room.localParticipant.setCameraEnabled(true)
-      await room.localParticipant.setMicrophoneEnabled(true)
-      await room.localParticipant.setMetadata('pink-chat-host')
-      const startedAt = new Date().toISOString()
-      setLive({ hostId: getLiveClientId(), hostName: name.trim(), startedAt })
+      // The initial viewer token intentionally cannot publish. Reconnect with
+      // a host token before enabling camera/microphone.
+      const data = await getLiveKitToken(true)
+      const oldRoom = liveRoomRef.current
+      if (oldRoom) {
+        try { oldRoom.disconnect() } catch {}
+      }
+
+      hostRoom = new Room({ adaptiveStream: true, dynacast: true })
+      liveRoomRef.current = hostRoom
+      hostRoom.on(RoomEvent.ParticipantConnected, () => {
+        setLiveViewers(Array.from(hostRoom.remoteParticipants.values()).length)
+      })
+      hostRoom.on(RoomEvent.ParticipantDisconnected, () => {
+        setLiveViewers(Array.from(hostRoom.remoteParticipants.values()).length)
+      })
+
+      await hostRoom.connect(data.url, data.token)
+      await hostRoom.localParticipant.setCameraEnabled(true)
+      await hostRoom.localParticipant.setMicrophoneEnabled(true)
+
+      setLive({ hostId: getLiveClientId(), hostName: name.trim(), startedAt: new Date().toISOString() })
       setIsHostingLive(true)
       isHostingLiveRef.current = true
       setLiveMuted(false)
       setLiveCameraOff(false)
-      const pub = room.localParticipant.getTrackPublication(Track.Source.Camera)
+      setLiveViewers(Array.from(hostRoom.remoteParticipants.values()).length)
+
+      const pub = hostRoom.localParticipant.getTrackPublication(Track.Source.Camera)
       if (pub?.track && localVideoRef.current) pub.track.attach(localVideoRef.current)
-      setLiveViewers(Array.from(room.remoteParticipants.values()).length)
     } catch (err) {
+      try { hostRoom?.disconnect() } catch {}
       setLiveError(err.message || 'Không thể bắt đầu livestream.')
+      setIsHostingLive(false)
+      isHostingLiveRef.current = false
     }
   }
 
@@ -407,15 +486,19 @@ export default function Home() {
     try {
       await room.localParticipant.setCameraEnabled(false)
       await room.localParticipant.setMicrophoneEnabled(false)
-      await room.localParticipant.setMetadata('')
     } catch {}
     detachLiveTracks()
+    try { room.disconnect() } catch {}
+    liveRoomRef.current = null
     setIsHostingLive(false)
     isHostingLiveRef.current = false
     setLive(null)
     setLiveViewers(0)
     setLiveMuted(false)
     setLiveCameraOff(false)
+    // Reconnect as viewer so the same user can still watch another live.
+    setLiveError('')
+    window.setTimeout(() => window.location.reload(), 50)
   }
 
   function toggleLiveMute() {
@@ -564,7 +647,9 @@ export default function Home() {
     localStorage.removeItem(USER_KEY)
     localStorage.removeItem(SESSION_KEY)
     setJoined(false); setName(''); setAuthUsername(''); setAuthPassword(''); setAuthMode('login')
-    stopLiveStream(); closeLivePeers(); setLive(null); setIsHostingLive(false)
+    try { liveRoomRef.current?.disconnect() } catch {}
+    liveRoomRef.current = null
+    setLive(null); setIsHostingLive(false); isHostingLiveRef.current = false
   }
 
   async function submitAuth(e) {
