@@ -43,6 +43,21 @@ export default function Home() {
   const [unreadByChannel, setUnreadByChannel] = useState({})
   const [newMessageCount, setNewMessageCount] = useState(0)
   const [sendError, setSendError] = useState('')
+  const [live, setLive] = useState(null)
+  const [liveError, setLiveError] = useState('')
+  const [isHostingLive, setIsHostingLive] = useState(false)
+  const [liveViewers, setLiveViewers] = useState(0)
+  const [remoteStream, setRemoteStream] = useState(null)
+  const [liveMuted, setLiveMuted] = useState(false)
+  const [liveCameraOff, setLiveCameraOff] = useState(false)
+  const liveSignalRef = useRef(null)
+  const liveClientIdRef = useRef(null)
+  const liveStreamRef = useRef(null)
+  const livePeersRef = useRef(new Map())
+  const liveViewerPeerRef = useRef(null)
+  const liveHostRef = useRef(null)
+  const localVideoRef = useRef(null)
+  const remoteVideoRef = useRef(null)
   const unreadRef = useRef(0)
   const channelRef = useRef(null)
   const bottomRef = useRef(null)
@@ -54,6 +69,28 @@ export default function Home() {
   const channelIdRef = useRef('')
   const firstLoadRef = useRef(true)
   const mountedRef = useRef(false)
+
+  function getLiveClientId() {
+    if (!liveClientIdRef.current) {
+      liveClientIdRef.current = `${name.trim().toLowerCase()}-${crypto.randomUUID()}`
+    }
+    return liveClientIdRef.current
+  }
+
+  function stopLiveStream() {
+    liveStreamRef.current?.getTracks().forEach(t => t.stop())
+    liveStreamRef.current = null
+    if (localVideoRef.current) localVideoRef.current.srcObject = null
+  }
+
+  function closeLivePeers() {
+    livePeersRef.current.forEach(pc => pc.close())
+    livePeersRef.current.clear()
+    liveViewerPeerRef.current?.close()
+    liveViewerPeerRef.current = null
+    setRemoteStream(null)
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null
+  }
 
   useEffect(() => {
     const saved = localStorage.getItem(USER_KEY)
@@ -238,6 +275,134 @@ export default function Home() {
       })
     return () => { supabase.removeChannel(realtime); setConnectionStatus('disconnected') }
   }, [joined, name])
+
+  // WebRTC P2P live: Supabase Broadcast chỉ làm signaling, video đi trực tiếp giữa các máy.
+  useEffect(() => {
+    if (!joined || !name.trim() || !channelId) return
+    const clientId = getLiveClientId()
+    const signal = supabase.channel(`pink-chat-live-${channelId}`, { config: { broadcast: { self: false } } })
+    liveSignalRef.current = signal
+    let alive = true
+
+    const sendSignal = payload => signal.send({ type: 'broadcast', event: 'live-signal', payload }).catch(() => {})
+
+    const makeHostPeer = async viewerId => {
+      const stream = liveStreamRef.current
+      if (!stream) return
+      const old = livePeersRef.current.get(viewerId)
+      old?.close()
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
+      livePeersRef.current.set(viewerId, pc)
+      stream.getTracks().forEach(track => pc.addTrack(track, stream))
+      pc.onicecandidate = e => e.candidate && sendSignal({ type:'ice', from:clientId, to:viewerId, candidate:e.candidate })
+      pc.onconnectionstatechange = () => {
+        if (['failed','closed','disconnected'].includes(pc.connectionState)) {
+          pc.close(); livePeersRef.current.delete(viewerId); setLiveViewers(livePeersRef.current.size)
+        }
+      }
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+      await sendSignal({ type:'offer', from:clientId, to:viewerId, offer:pc.localDescription })
+      setLiveViewers(livePeersRef.current.size)
+    }
+
+    const handleSignal = async ({ payload }) => {
+      if (!alive || !payload || payload.to && payload.to !== clientId) return
+      try {
+        if (payload.type === 'live-start') {
+          setLive({ hostId: payload.from, hostName: payload.hostName, startedAt: payload.startedAt })
+          setLiveError('')
+          if (payload.from !== clientId && !isHostingLive) {
+            await sendSignal({ type:'viewer-join', from:clientId, to:payload.from })
+          }
+          return
+        }
+        if (payload.type === 'live-end') {
+          setLive(null); setIsHostingLive(false); setLiveViewers(0); closeLivePeers(); stopLiveStream();
+          return
+        }
+        if (payload.type === 'viewer-join' && isHostingLive && payload.to === clientId) {
+          await makeHostPeer(payload.from)
+          return
+        }
+        if (payload.type === 'offer' && payload.to === clientId && !isHostingLive) {
+          liveHostRef.current = payload.from
+          const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
+          liveViewerPeerRef.current = pc
+          pc.onicecandidate = e => e.candidate && sendSignal({ type:'ice', from:clientId, to:payload.from, candidate:e.candidate })
+          pc.ontrack = e => { const stream = e.streams[0]; setRemoteStream(stream); if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream }
+          pc.onconnectionstatechange = () => {
+            if (['failed','closed','disconnected'].includes(pc.connectionState)) { setRemoteStream(null); setLiveError('Kết nối livestream bị gián đoạn.') }
+          }
+          await pc.setRemoteDescription(payload.offer)
+          const answer = await pc.createAnswer()
+          await pc.setLocalDescription(answer)
+          await sendSignal({ type:'answer', from:clientId, to:payload.from, answer:pc.localDescription })
+          return
+        }
+        if (payload.type === 'answer' && payload.to === clientId && isHostingLive) {
+          const pc = livePeersRef.current.get(payload.from)
+          if (pc) await pc.setRemoteDescription(payload.answer)
+          return
+        }
+        if (payload.type === 'ice' && payload.to === clientId && payload.candidate) {
+          const pc = isHostingLive ? livePeersRef.current.get(payload.from) : liveViewerPeerRef.current
+          if (pc) await pc.addIceCandidate(payload.candidate)
+        }
+      } catch (err) {
+        console.error('WebRTC signaling error', err)
+        setLiveError('Không thể kết nối livestream. Hãy thử vào lại live.')
+      }
+    }
+
+    signal.on('broadcast', { event: 'live-signal' }, handleSignal).subscribe(async status => {
+      if (status !== 'SUBSCRIBED') return
+      // Host vừa đổi kênh/reload vẫn có thể công bố trạng thái live.
+      if (isHostingLive && liveStreamRef.current) {
+        await sendSignal({ type:'live-start', from:clientId, hostName:name.trim(), startedAt:live?.startedAt || new Date().toISOString() })
+      }
+    })
+
+    return () => {
+      alive = false
+      if (liveSignalRef.current === signal) liveSignalRef.current = null
+      supabase.removeChannel(signal)
+      if (!isHostingLive) { liveViewerPeerRef.current?.close(); liveViewerPeerRef.current = null; setRemoteStream(null) }
+    }
+  }, [joined, name, channelId, isHostingLive])
+
+  async function startLive() {
+    if (!channelId || isHostingLive) return
+    setLiveError('')
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('Trình duyệt không hỗ trợ Camera/Microphone.')
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+      liveStreamRef.current = stream
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream
+      const startedAt = new Date().toISOString()
+      const info = { hostId:getLiveClientId(), hostName:name.trim(), startedAt }
+      setLive(info); setIsHostingLive(true); setLiveViewers(0)
+      setTimeout(() => liveSignalRef.current?.send({ type:'broadcast', event:'live-signal', payload:{ type:'live-start', from:getLiveClientId(), hostName:name.trim(), startedAt } }), 100)
+    } catch (err) { setLiveError(err.message || 'Không thể mở camera/microphone.') }
+  }
+
+  async function stopLive() {
+    if (!isHostingLive) return
+    await liveSignalRef.current?.send({ type:'broadcast', event:'live-signal', payload:{ type:'live-end', from:getLiveClientId(), to:null } })
+    closeLivePeers(); stopLiveStream(); setIsHostingLive(false); setLive(null); setLiveViewers(0)
+  }
+
+  function toggleLiveMute() {
+    const next = !liveMuted
+    liveStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = !next })
+    setLiveMuted(next)
+  }
+
+  function toggleLiveCamera() {
+    const next = !liveCameraOff
+    liveStreamRef.current?.getVideoTracks().forEach(t => { t.enabled = !next })
+    setLiveCameraOff(next)
+  }
 
   // Typing indicator uses broadcast only; it is isolated per room.
   useEffect(() => {
@@ -470,7 +635,7 @@ export default function Home() {
     <header><div><h1>💗 Pink Chat</h1><span>{currentChannel?.name || 'Phòng chat'} • <i className={`connection-dot ${connectionStatus}`}></i>{connectionStatus==='connected'?'Đã kết nối':connectionStatus==='connecting'?'Đang kết nối...':'Mất kết nối'}</span></div><div className="header-actions"><button className="admin-btn" onClick={()=>setAdminOpen(true)}>⚙ Admin</button>{notificationPermission !== 'granted' && <button className="notify" onClick={enableNotifications}>🔔 Bật thông báo</button>}<button className="logout" onClick={logout}>Đổi tên</button></div></header>
     <section className="layout">
       <aside><h3>💬 Kênh chat</h3><div className="channels">{channels.map(c=><div className="channel-row" key={c.id}><button className={c.id===channelId?'channel active':'channel'} onClick={()=>setChannelId(c.id)}># {c.name}{unreadByChannel[String(c.id)] ? <em className="unread-badge">{unreadByChannel[String(c.id)] > 99 ? '99+' : unreadByChannel[String(c.id)]}</em> : null}</button>{adminLogged && c.name!=='Chung' && <button className="channel-delete" title="Xóa kênh" onClick={()=>deleteChannel(c)}>×</button>}</div>)}</div><h3 className="online-title">🟢 Người online <em>{online.length}</em></h3>{online.map((u,i)=><div className="user" key={u+i}><span className="user-name"><img className="avatar avatar-sm" src={avatarFor(u)} alt=""/><i/>{u}{u===name?' (Bạn)':''}</span>{adminLogged && u!==name && <button className="block-user-btn" title={`Block ${u}`} onClick={()=>blockUser(u)}>🚫 Block</button>}</div>)}{online.length===0&&<small>Đang kết nối...</small>}<div className="note">Tin nhắn được đồng bộ cho mọi người đang trong phòng.</div></aside>
-      <div className="chat"><div className="messages" ref={messagesBoxRef} onScroll={handleMessagesScroll}>{newMessageCount>0&&<button className="new-message-pill" onClick={jumpToLatest}>↓ {newMessageCount} tin nhắn mới</button>}{messages.length===0&&<div className="empty">Chưa có tin nhắn. Hãy bắt đầu 💬</div>}{messages.map(m=>{
+      <div className="chat">{(live || isHostingLive) && <div className="live-panel"><div className="live-panel-head"><div><b>🔴 LIVE</b><span>{isHostingLive ? `Bạn đang livestream • ${liveViewers} người xem` : `${live?.hostName || "Đang livestream"} đang phát`}</span></div><div className="live-actions">{isHostingLive ? <><button onClick={toggleLiveMute}>{liveMuted ? "🔇 Bật mic" : "🎤 Tắt mic"}</button><button onClick={toggleLiveCamera}>{liveCameraOff ? "📷 Bật cam" : "🚫 Tắt cam"}</button><button className="live-stop" onClick={stopLive}>⏹ Kết thúc</button></> : <span className="live-viewers">👁️ Đang xem</span>}</div></div><div className="live-video-wrap">{isHostingLive ? <video ref={localVideoRef} autoPlay muted playsInline className="live-video"/> : remoteStream ? <video ref={remoteVideoRef} autoPlay playsInline className="live-video"/> : <div className="live-wait">Đang kết nối tới livestream...</div>}{liveError&&<div className="live-error">⚠️ {liveError}</div>}</div></div>}{!live && !isHostingLive && <button className="start-live-btn" onClick={startLive}>🔴 Livestream</button>}<div className="messages" ref={messagesBoxRef} onScroll={handleMessagesScroll}>{newMessageCount>0&&<button className="new-message-pill" onClick={jumpToLatest}>↓ {newMessageCount} tin nhắn mới</button>}{messages.length===0&&<div className="empty">Chưa có tin nhắn. Hãy bắt đầu 💬</div>}{messages.map(m=>{
           const parent=m.reply_to ? messages.find(x=>String(x.id)===String(m.reply_to)) : null
           const rx=reactions[m.id]||[]
           const counts=rx.reduce((a,r)=>(a[r.emoji]=(a[r.emoji]||0)+1,a),{})
