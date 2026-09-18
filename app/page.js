@@ -34,6 +34,7 @@ export default function Home() {
   const channelRef = useRef(null)
   const bottomRef = useRef(null)
   const input = useRef(null)
+  const fileInput = useRef(null)
   const typingTimer = useRef(null)
 
   useEffect(() => {
@@ -99,7 +100,11 @@ export default function Home() {
     }
     loadMessages()
 
-    const realtime = supabase.channel(`pink-chat-${channelId}`, { config: { presence: { key: crypto.randomUUID() }, broadcast: { self: false } } })
+    // Fallback polling: if Supabase Realtime is delayed/misconfigured,
+    // other users still see new messages without refreshing the page.
+    const pollTimer = setInterval(loadMessages, 1500)
+
+    const realtime = supabase.channel(`pink-chat-${channelId}-${crypto.randomUUID()}`, { config: { presence: { key: crypto.randomUUID() }, broadcast: { self: false } } })
     channelRef.current = realtime
     realtime
       .on('presence', { event: 'sync' }, () => {
@@ -125,7 +130,12 @@ export default function Home() {
       })
       .subscribe(async status => { if (status === 'SUBSCRIBED') await realtime.track({ name: name.trim(), online_at: new Date().toISOString(), typing: false }) })
 
-    return () => { active = false; supabase.removeChannel(realtime); if (channelRef.current === realtime) channelRef.current = null }
+    return () => {
+      active = false
+      clearInterval(pollTimer)
+      supabase.removeChannel(realtime)
+      if (channelRef.current === realtime) channelRef.current = null
+    }
   }, [joined, name, channelId])
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
@@ -145,12 +155,8 @@ export default function Home() {
         const ext = file.name.split('.').pop()?.toLowerCase() || 'jpg'
         const path = `${crypto.randomUUID()}.${ext}`
         const { error: uploadError } = await supabase.storage.from('images').upload(path, file, { contentType: file.type, upsert: false })
-        if (uploadError) {
-          throw new Error(`Không thể tải hình lên: ${uploadError.message}. Hãy chạy phần STORAGE trong schema.sql trên Supabase.`)
-        }
-        const publicUrlResult = supabase.storage.from('images').getPublicUrl(path)
-        image_url = publicUrlResult.data.publicUrl
-        if (!image_url) throw new Error('Không lấy được URL hình ảnh.')
+        if (uploadError) throw uploadError
+        image_url = supabase.storage.from('images').getPublicUrl(path).data.publicUrl
       }
       const { error } = await supabase.from('messages').insert({ name: name.trim(), message: text.trim() || null, image_url, channel_id: channelId, reply_to: replyTo?.id || null })
       if (error) {
@@ -159,7 +165,7 @@ export default function Home() {
         }
         throw error
       }
-      setText(''); setFile(null); setReplyTo(null); setShowEmoji(false); if (input.current) input.current.value = ''
+      setText(''); setFile(null); setReplyTo(null); setShowEmoji(false); if (fileInput.current) fileInput.current.value = ''
     } catch (err) { alert(err.message || 'Gửi tin nhắn thất bại.') }
     finally { setSending(false) }
   }
@@ -188,6 +194,20 @@ export default function Home() {
   }
 
   function startReply(message) { setReplyTo(message); input.current?.focus() }
+
+  function handlePaste(e) {
+    const items = Array.from(e.clipboardData?.items || [])
+    const imageItem = items.find(item => item.type.startsWith('image/'))
+    if (!imageItem) return
+    const pastedFile = imageItem.getAsFile()
+    if (!pastedFile) return
+    e.preventDefault()
+    if (pastedFile.size > 5 * 1024 * 1024) return alert('Ảnh tối đa 5MB.')
+    const ext = pastedFile.type.split('/')[1] || 'png'
+    const fileName = `pasted-${Date.now()}.${ext}`
+    const imageFile = new File([pastedFile], fileName, { type: pastedFile.type })
+    setFile(imageFile)
+  }
 
   function chooseImage(e) {
     const f = e.target.files?.[0]; if (!f) return
@@ -252,7 +272,7 @@ export default function Home() {
             <div className="msg-actions"><button onClick={()=>startReply(m)}>↩️ Reply</button><button onClick={()=>toggleReaction(m.id,'❤️')}>❤️</button><button onClick={()=>toggleReaction(m.id,'😂')}>😂</button><button onClick={()=>toggleReaction(m.id,'👍')}>👍</button></div>
           </div></div>
         })}<div ref={bottomRef}/></div>
-        <div className="composer">{typingUsers.length>0&&<div className="typing">✍️ {typingUsers.join(', ')} đang nhập...</div>}{replyTo&&<div className="replying">↩️ Đang trả lời <b>{replyTo.name}</b>: {replyTo.message||'📷 Hình ảnh'}<button onClick={()=>setReplyTo(null)}>×</button></div>}{file&&<div className="preview">📷 {file.name}<button onClick={()=>{setFile(null);if(input.current)input.current.value='' }}>×</button></div>}<div className="row"><label className="attach">📷<input ref={input} type="file" accept="image/*" onChange={chooseImage}/></label><div className="emoji-wrap"><button className="emoji-btn" onClick={()=>setShowEmoji(v=>!v)}>😀</button>{showEmoji&&<div className="emoji-picker">{['😀','😂','😍','🥰','😎','😮','😢','😡','👍','👎','❤️','🔥','🎉','👏','🙏','💯','🤣','😘'].map(e=><button key={e} onClick={()=>addEmoji(e)}>{e}</button>)}</div>}</div><input value={text} onChange={e=>updateTyping(e.target.value)} onKeyDown={e=>e.key==='Enter'&&!e.shiftKey&&(e.preventDefault(),send())} placeholder={`Nhắn trong #${currentChannel?.name || 'Chung'}...`}/><button disabled={sending} onClick={send}>{sending?'...':'Gửi'}</button></div></div>
+        <div className="composer">{typingUsers.length>0&&<div className="typing">✍️ {typingUsers.join(', ')} đang nhập...</div>}{replyTo&&<div className="replying">↩️ Đang trả lời <b>{replyTo.name}</b>: {replyTo.message||'📷 Hình ảnh'}<button onClick={()=>setReplyTo(null)}>×</button></div>}{file&&<div className="preview">📷 {file.name}<button onClick={()=>{setFile(null);if(fileInput.current)fileInput.current.value='' }}>×</button></div>}<div className="row"><label className="attach">📷<input ref={fileInput} type="file" accept="image/*" onChange={chooseImage}/></label><div className="emoji-wrap"><button className="emoji-btn" onClick={()=>setShowEmoji(v=>!v)}>😀</button>{showEmoji&&<div className="emoji-picker">{['😀','😂','😍','🥰','😎','😮','😢','😡','👍','👎','❤️','🔥','🎉','👏','🙏','💯','🤣','😘'].map(e=><button key={e} onClick={()=>addEmoji(e)}>{e}</button>)}</div>}</div><input ref={input} value={text} onPaste={handlePaste} onChange={e=>updateTyping(e.target.value)} onKeyDown={e=>e.key==='Enter'&&!e.shiftKey&&(e.preventDefault(),send())} placeholder={`Nhắn trong #${currentChannel?.name || 'Chung'}...`}/><button disabled={sending} onClick={send}>{sending?'...':'Gửi'}</button></div></div>
       </div>
     </section>
 
