@@ -7,6 +7,7 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://cemjicquyg
 const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || 'sb_publishable_oM2aO9hLAIhTSSbta4QqEQ_UaiNfIQv'
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
 const USER_KEY = 'pink-chat-user-v2'
+const SESSION_KEY = 'pink-chat-session-v1'
 
 function avatarFor(userName) {
   const seed = encodeURIComponent(String(userName || 'user').trim().toLowerCase())
@@ -16,6 +17,11 @@ function avatarFor(userName) {
 export default function Home() {
   const [name, setName] = useState('')
   const [joined, setJoined] = useState(false)
+  const [authMode, setAuthMode] = useState('login')
+  const [authUsername, setAuthUsername] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authBusy, setAuthBusy] = useState(false)
+  const [authError, setAuthError] = useState('')
   const [text, setText] = useState('')
   const [messages, setMessages] = useState([])
   const [online, setOnline] = useState([])
@@ -69,6 +75,24 @@ export default function Home() {
   const channelIdRef = useRef('')
   const firstLoadRef = useRef(true)
   const mountedRef = useRef(false)
+  const isHostingLiveRef = useRef(false)
+  const liveRef = useRef(null)
+
+  useEffect(() => { isHostingLiveRef.current = isHostingLive }, [isHostingLive])
+  useEffect(() => { liveRef.current = live }, [live])
+
+  useEffect(() => {
+    if (localVideoRef.current && liveStreamRef.current) {
+      localVideoRef.current.srcObject = liveStreamRef.current
+      localVideoRef.current.play?.().catch(() => {})
+    }
+  }, [isHostingLive, live])
+  useEffect(() => {
+    if (remoteVideoRef.current && remoteStream) {
+      remoteVideoRef.current.srcObject = remoteStream
+      remoteVideoRef.current.play?.().catch(() => {})
+    }
+  }, [remoteStream])
 
   function getLiveClientId() {
     if (!liveClientIdRef.current) {
@@ -94,7 +118,13 @@ export default function Home() {
 
   useEffect(() => {
     const saved = localStorage.getItem(USER_KEY)
-    if (saved) { setName(saved); setJoined(true) }
+    const session = localStorage.getItem(SESSION_KEY)
+    if (saved && session) {
+      supabase.rpc('validate_chat_session', { p_token: session }).then(({data}) => {
+        if (data?.username) { setName(data.username); setAuthUsername(data.username); setJoined(true) }
+        else { localStorage.removeItem(USER_KEY); localStorage.removeItem(SESSION_KEY) }
+      })
+    }
     if ('Notification' in window) setNotificationPermission(Notification.permission)
     mountedRef.current = true
     try { setUnreadByChannel(JSON.parse(localStorage.getItem('pink-chat-unread-v1') || '{}')) } catch {}
@@ -276,7 +306,7 @@ export default function Home() {
     return () => { supabase.removeChannel(realtime); setConnectionStatus('disconnected') }
   }, [joined, name])
 
-  // WebRTC P2P live: Supabase Broadcast chỉ làm signaling, video đi trực tiếp giữa các máy.
+  // WebRTC P2P live: signaling channel stays stable while the host/viewer state changes.
   useEffect(() => {
     if (!joined || !name.trim() || !channelId) return
     const clientId = getLiveClientId()
@@ -288,9 +318,8 @@ export default function Home() {
 
     const makeHostPeer = async viewerId => {
       const stream = liveStreamRef.current
-      if (!stream) return
-      const old = livePeersRef.current.get(viewerId)
-      old?.close()
+      if (!stream || !isHostingLiveRef.current) return
+      livePeersRef.current.get(viewerId)?.close()
       const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
       livePeersRef.current.set(viewerId, pc)
       stream.getTracks().forEach(track => pc.addTrack(track, stream))
@@ -307,59 +336,51 @@ export default function Home() {
     }
 
     const handleSignal = async ({ payload }) => {
-      if (!alive || !payload || payload.to && payload.to !== clientId) return
+      if (!alive || !payload || (payload.to && payload.to !== clientId)) return
       try {
         if (payload.type === 'live-start') {
           setLive({ hostId: payload.from, hostName: payload.hostName, startedAt: payload.startedAt })
           setLiveError('')
-          if (payload.from !== clientId && !isHostingLive) {
-            await sendSignal({ type:'viewer-join', from:clientId, to:payload.from })
-          }
+          if (payload.from !== clientId && !isHostingLiveRef.current) await sendSignal({ type:'viewer-join', from:clientId, to:payload.from })
           return
         }
         if (payload.type === 'live-end') {
           setLive(null); setIsHostingLive(false); setLiveViewers(0); closeLivePeers(); stopLiveStream();
           return
         }
-        if (payload.type === 'viewer-join' && isHostingLive && payload.to === clientId) {
-          await makeHostPeer(payload.from)
-          return
+        if (payload.type === 'viewer-join' && isHostingLiveRef.current && payload.to === clientId) {
+          await makeHostPeer(payload.from); return
         }
-        if (payload.type === 'offer' && payload.to === clientId && !isHostingLive) {
+        if (payload.type === 'offer' && payload.to === clientId && !isHostingLiveRef.current) {
           liveHostRef.current = payload.from
+          liveViewerPeerRef.current?.close()
           const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
           liveViewerPeerRef.current = pc
           pc.onicecandidate = e => e.candidate && sendSignal({ type:'ice', from:clientId, to:payload.from, candidate:e.candidate })
-          pc.ontrack = e => { const stream = e.streams[0]; setRemoteStream(stream); if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream }
-          pc.onconnectionstatechange = () => {
-            if (['failed','closed','disconnected'].includes(pc.connectionState)) { setRemoteStream(null); setLiveError('Kết nối livestream bị gián đoạn.') }
-          }
+          pc.ontrack = e => { const stream = e.streams?.[0] || new MediaStream([e.track]); setRemoteStream(stream) }
+          pc.onconnectionstatechange = () => { if (['failed','closed','disconnected'].includes(pc.connectionState)) { setRemoteStream(null); setLiveError('Kết nối livestream bị gián đoạn.') } }
           await pc.setRemoteDescription(payload.offer)
           const answer = await pc.createAnswer()
           await pc.setLocalDescription(answer)
           await sendSignal({ type:'answer', from:clientId, to:payload.from, answer:pc.localDescription })
           return
         }
-        if (payload.type === 'answer' && payload.to === clientId && isHostingLive) {
+        if (payload.type === 'answer' && payload.to === clientId && isHostingLiveRef.current) {
           const pc = livePeersRef.current.get(payload.from)
           if (pc) await pc.setRemoteDescription(payload.answer)
           return
         }
         if (payload.type === 'ice' && payload.to === clientId && payload.candidate) {
-          const pc = isHostingLive ? livePeersRef.current.get(payload.from) : liveViewerPeerRef.current
-          if (pc) await pc.addIceCandidate(payload.candidate)
+          const pc = isHostingLiveRef.current ? livePeersRef.current.get(payload.from) : liveViewerPeerRef.current
+          if (pc && pc.remoteDescription) await pc.addIceCandidate(payload.candidate)
+          return
         }
-      } catch (err) {
-        console.error('WebRTC signaling error', err)
-        setLiveError('Không thể kết nối livestream. Hãy thử vào lại live.')
-      }
+      } catch (err) { console.error('WebRTC signaling error', err); setLiveError(err.message || 'Không thể kết nối livestream.') }
     }
 
     signal.on('broadcast', { event: 'live-signal' }, handleSignal).subscribe(async status => {
-      if (status !== 'SUBSCRIBED') return
-      // Host vừa đổi kênh/reload vẫn có thể công bố trạng thái live.
-      if (isHostingLive && liveStreamRef.current) {
-        await sendSignal({ type:'live-start', from:clientId, hostName:name.trim(), startedAt:live?.startedAt || new Date().toISOString() })
+      if (status === 'SUBSCRIBED' && isHostingLiveRef.current && liveStreamRef.current) {
+        await sendSignal({ type:'live-start', from:clientId, hostName:name.trim(), startedAt:liveRef.current?.startedAt || new Date().toISOString() })
       }
     })
 
@@ -367,9 +388,9 @@ export default function Home() {
       alive = false
       if (liveSignalRef.current === signal) liveSignalRef.current = null
       supabase.removeChannel(signal)
-      if (!isHostingLive) { liveViewerPeerRef.current?.close(); liveViewerPeerRef.current = null; setRemoteStream(null) }
+      if (!isHostingLiveRef.current) { liveViewerPeerRef.current?.close(); liveViewerPeerRef.current = null; setRemoteStream(null) }
     }
-  }, [joined, name, channelId, isHostingLive])
+  }, [joined, name, channelId])
 
   async function startLive() {
     if (!channelId || isHostingLive) return
@@ -378,11 +399,10 @@ export default function Home() {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Trình duyệt không hỗ trợ Camera/Microphone.')
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
       liveStreamRef.current = stream
-      if (localVideoRef.current) localVideoRef.current.srcObject = stream
       const startedAt = new Date().toISOString()
       const info = { hostId:getLiveClientId(), hostName:name.trim(), startedAt }
-      setLive(info); setIsHostingLive(true); setLiveViewers(0)
-      setTimeout(() => liveSignalRef.current?.send({ type:'broadcast', event:'live-signal', payload:{ type:'live-start', from:getLiveClientId(), hostName:name.trim(), startedAt } }), 100)
+      setLive(info); setIsHostingLive(true); isHostingLiveRef.current = true; setLiveViewers(0)
+      requestAnimationFrame(() => { if (localVideoRef.current) { localVideoRef.current.srcObject = stream; localVideoRef.current.play?.().catch(() => {}) } })
     } catch (err) { setLiveError(err.message || 'Không thể mở camera/microphone.') }
   }
 
@@ -439,104 +459,32 @@ export default function Home() {
     setNewMessageCount(0)
   }
 
-  function join(e) {
-    e.preventDefault(); const n = name.trim(); if (!n) return
-    localStorage.setItem(USER_KEY, n); setName(n); setJoined(true); setConnectionStatus('connecting')
-    if (Notification.permission === 'default') enableNotifications()
-  }
-
-  async function sendSticker(sticker) {
-    if (sending || !channelId || !sticker) return
-    setSending(true)
-    try {
-      const { error } = await supabase.from('messages').insert({
-        name: name.trim(), message: null, image_url: null, sticker_url: sticker.url, message_type: 'sticker', channel_id: channelId, reply_to: replyTo?.id || null
-      })
-      if (error) throw error
-      setReplyTo(null); setShowStickers(false); setShowEmoji(false)
-    } catch (err) { alert(err.message || 'Gửi sticker thất bại.') }
-    finally { setSending(false) }
-  }
-
-  async function send() {
-    if (sending || (!text.trim() && !file) || !channelId) return
-    setSending(true)
-    setSendError('')
-    try {
-      let image_url = null
-      if (file) {
-        const ext = file.name.split('.').pop()?.toLowerCase() || 'jpg'
-        const path = `${crypto.randomUUID()}.${ext}`
-        const { error: uploadError } = await supabase.storage.from('images').upload(path, file, { contentType: file.type, upsert: false })
-        if (uploadError) throw uploadError
-        image_url = supabase.storage.from('images').getPublicUrl(path).data.publicUrl
-      }
-      const { error } = await supabase.from('messages').insert({ name: name.trim(), message: text.trim() || null, image_url, channel_id: channelId, reply_to: replyTo?.id || null })
-      if (error) {
-        if (String(error.message || '').includes('USER_BLOCKED')) {
-          throw new Error('Bạn đã bị block và không thể gửi tin nhắn.')
-        }
-        throw error
-      }
-      setText(''); setFile(null); setReplyTo(null); setShowEmoji(false); if (fileInput.current) fileInput.current.value = ''
-    } catch (err) { setSendError(err.message || 'Gửi tin nhắn thất bại.') }
-    finally { setSending(false) }
-  }
-
-  async function retrySend() {
-    setSendError('')
-    await send()
-  }
-
-  async function updateTyping(value) {
-    setText(value)
-    if (!channelRef.current) return
-    clearTimeout(typingTimer.current)
-    try { await channelRef.current.send({ type: 'broadcast', event: 'typing', payload: { name: name.trim(), typing: true } }) } catch {}
-    typingTimer.current = setTimeout(async () => {
-      try { await channelRef.current?.send({ type: 'broadcast', event: 'typing', payload: { name: name.trim(), typing: false } }) } catch {}
-    }, 1200)
-  }
-
-  function addEmoji(emoji) { setText(v => v + emoji); setShowEmoji(false); input.current?.focus() }
-
-  async function toggleReaction(messageId, emoji) {
-    const existing = (reactions[messageId] || []).find(r => r.name === name && r.emoji === emoji)
-    if (existing) {
-      await supabase.from('message_reactions').delete().eq('id', existing.id)
-      setReactions(prev => ({ ...prev, [messageId]: (prev[messageId] || []).filter(r => r.id !== existing.id) }))
-    } else {
-      const { data, error } = await supabase.from('message_reactions').insert({ message_id: messageId, name: name.trim(), emoji }).select().single()
-      if (!error && data) setReactions(prev => ({ ...prev, [messageId]: [...(prev[messageId] || []), data] }))
-    }
-  }
-
-  function startReply(message) { setReplyTo(message); input.current?.focus() }
-
-  function handlePaste(e) {
-    const items = Array.from(e.clipboardData?.items || [])
-    const imageItem = items.find(item => item.type.startsWith('image/'))
-    if (!imageItem) return
-    const pastedFile = imageItem.getAsFile()
-    if (!pastedFile) return
-    e.preventDefault()
-    if (pastedFile.size > 5 * 1024 * 1024) return alert('Ảnh tối đa 5MB.')
-    const ext = pastedFile.type.split('/')[1] || 'png'
-    const fileName = `pasted-${Date.now()}.${ext}`
-    const imageFile = new File([pastedFile], fileName, { type: pastedFile.type })
-    setFile(imageFile)
-  }
-
-  function chooseImage(e) {
-    const f = e.target.files?.[0]; if (!f) return
-    if (!f.type.startsWith('image/')) return alert('Chỉ chọn file ảnh.')
-    if (f.size > 5 * 1024 * 1024) return alert('Ảnh tối đa 5MB.')
-    setFile(f)
-  }
-
   function logout() {
-    localStorage.removeItem(USER_KEY); setJoined(false); setName(''); setMessages([]); setUnreadByChannel({}); localStorage.removeItem('pink-chat-unread-v1'); unreadRef.current = 0; document.title = '💗 Pink Chat'
-    if (channelRef.current) supabase.removeChannel(channelRef.current)
+    localStorage.removeItem(USER_KEY)
+    localStorage.removeItem(SESSION_KEY)
+    setJoined(false); setName(''); setAuthUsername(''); setAuthPassword(''); setAuthMode('login')
+    stopLiveStream(); closeLivePeers(); setLive(null); setIsHostingLive(false)
+  }
+
+  async function submitAuth(e) {
+    e.preventDefault()
+    const username = authUsername.trim()
+    const password = authPassword
+    setAuthError('')
+    if (!/^[A-Za-z0-9_]{3,30}$/.test(username)) return setAuthError('Tên đăng nhập 3–30 ký tự, chỉ dùng chữ, số và _.')
+    if (password.length < 6) return setAuthError('Mật khẩu phải có ít nhất 6 ký tự.')
+    setAuthBusy(true)
+    try {
+      const rpc = authMode === 'register' ? 'register_chat_account' : 'login_chat_account'
+      const { data, error } = await supabase.rpc(rpc, { p_username: username, p_password: password })
+      if (error) throw error
+      if (!data?.username || !data?.session_token) throw new Error('Đăng nhập thất bại.')
+      localStorage.setItem(USER_KEY, data.username)
+      localStorage.setItem(SESSION_KEY, data.session_token)
+      setName(data.username); setJoined(true); setAuthPassword(''); setAuthError(''); setConnectionStatus('connecting')
+      if ('Notification' in window && Notification.permission === 'default') enableNotifications()
+    } catch (err) { setAuthError(err.message || 'Không thể kết nối tài khoản.') }
+    finally { setAuthBusy(false) }
   }
 
   async function adminLogin(e) {
@@ -628,7 +576,7 @@ export default function Home() {
     return () => window.removeEventListener('keydown', onKey)
   }, [viewImage])
 
-  if (!joined) return <main className="login"><div className="card"><div className="logo">💗</div><h1>Pink Chat</h1><p>Nhập tên để tham gia phòng chat</p><form onSubmit={join}><input autoFocus value={name} onChange={e=>setName(e.target.value)} placeholder="Tên của bạn" maxLength={30}/><button>Vào chat</button></form></div></main>
+  if (!joined) return <main className="login"><div className="card"><div className="logo">💗</div><h1>Pink Chat</h1><p>{authMode==='register'?'Tạo tài khoản mới':'Đăng nhập tài khoản'}</p><form onSubmit={submitAuth}><input autoFocus value={authUsername} onChange={e=>setAuthUsername(e.target.value)} placeholder="Tên đăng nhập" maxLength={30}/><input type="password" value={authPassword} onChange={e=>setAuthPassword(e.target.value)} placeholder="Mật khẩu (tối thiểu 6 ký tự)" maxLength={72}/>{authError&&<div className="auth-error">⚠️ {authError}</div>}<button disabled={authBusy}>{authBusy?'Đang xử lý...':authMode==='register'?'Tạo tài khoản':'Đăng nhập'}</button></form><button className="auth-switch" onClick={()=>{setAuthMode(v=>v==='login'?'register':'login');setAuthError('')}}>{authMode==='login'?'Chưa có tài khoản? Tạo tài khoản':'Đã có tài khoản? Đăng nhập'}</button></div></main>
 
   const currentChannel = channels.find(c => c.id === channelId)
   return <main className="app">
